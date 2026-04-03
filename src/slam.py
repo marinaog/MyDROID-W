@@ -30,8 +30,19 @@ class SLAM:
         self.device = cfg["device"]
         self.verbose: bool = cfg["verbose"]
         self.logger = None
-        self.save_dir = cfg["data"]["output"] + "/" + cfg["scene"]
+        save_dir_base = cfg["data"]["output"] + "/" + cfg["scene"]
 
+        save_dir = save_dir_base
+        version = 2
+
+        while os.path.exists(save_dir):
+            save_dir = f"{save_dir_base}_{version}"
+            version += 1
+        if version > 0:
+            version -= 1
+        else:
+            version = ""
+        self.save_dir = save_dir
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = update_cam(cfg)
@@ -91,7 +102,7 @@ class SLAM:
         for file in os.listdir(self.save_dir):
             if file.startswith("events.out.tfevents."):
                 os.remove(os.path.join(self.save_dir, file))
-                
+
         event_writer = SummaryWriter(self.save_dir)
         self.tracker = Tracker(self, pipe, event_writer)
         self.printer.print("Tracking Triggered!", FontColor.TRACKER)
@@ -211,9 +222,9 @@ class SLAM:
                 fast_mode=self.cfg['fast_mode'],
             )
             full_traj_eval(traj_est, self.stream, self.printer, self.logger, f"{self.save_dir}/traj", "full_traj")
-            
+
             self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
-            
+
         else:
             traj_est = None
             with timer.section("Full Trajectory Filling"):
@@ -334,12 +345,12 @@ class SLAM:
 
         for p in processes:
             p.join()
-        
+
         # detect if the visualizer is still running
         if self.cfg['droidvis'] and self.visualizer.is_alive():
             exit_event.set()
             self.visualizer.join(timeout=10)
-        
+
         self.printer.terminate()
 
         for process in mp.active_children():
