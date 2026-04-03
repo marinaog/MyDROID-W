@@ -610,10 +610,21 @@ class DepthVideo:
         """ 
         visualize the uncertainty before and after optimization, disparity map
         """
-
         plot_dir = os.path.join(out_directory, "plots_" + iteration)
+        max_saved_plots = int(self.cfg.get("mapping", {}).get("max_saved_plots_per_scene", 10))
+        selected_idxs = list(range(self.counter.value))
+        if max_saved_plots > 0 and len(selected_idxs) > max_saved_plots:
+            if max_saved_plots == 1:
+                selected_idxs = [selected_idxs[-1]]
+            else:
+                n = len(selected_idxs)
+                sampled_positions = [
+                    (i * (n - 1)) // (max_saved_plots - 1) for i in range(max_saved_plots)
+                ]
+                selected_idxs = [selected_idxs[pos] for pos in sampled_positions]
+
         # add tqdm progress bar
-        for idx in tqdm(range(self.counter.value), desc="Visualizing all optimized parameters", total=self.counter.value):
+        for idx in tqdm(selected_idxs, desc="Visualizing all optimized parameters", total=len(selected_idxs)):
             img_i = self.images[idx].permute(1,2,0).cpu().numpy()
 
             uncer_pred = self.uncertainties[idx]

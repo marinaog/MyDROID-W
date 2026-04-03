@@ -1462,7 +1462,19 @@ class Mapper(object):
                                         iteration or stage of the process. 
                                         Default is "after_refine".
         """
-        video_idxs = self.video_idxs
+        video_idxs = list(self.video_idxs)
+        max_saved_plots = int(self.config.get("mapping", {}).get("max_saved_plots_per_scene", 10))
+        if max_saved_plots > 0 and len(video_idxs) > max_saved_plots:
+            # Uniformly sample keyframes so visual summaries stay compact.
+            if max_saved_plots == 1:
+                sampled_idxs = [video_idxs[-1]]
+            else:
+                n = len(video_idxs)
+                sampled_positions = [
+                    (i * (n - 1)) // (max_saved_plots - 1) for i in range(max_saved_plots)
+                ]
+                sampled_idxs = [video_idxs[pos] for pos in sampled_positions]
+            video_idxs = sampled_idxs
 
         plot_dir = os.path.join(save_dir, "plots_" + iteration)
         mkdir_p(plot_dir)

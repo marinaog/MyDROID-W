@@ -50,16 +50,16 @@ def load_metric_depth(idx,path):
     mono_depth_path = f"{path}/mono_priors/depths/{idx:05d}.npy"
     mono_depth = np.load(mono_depth_path)
     mono_depth_tensor = torch.from_numpy(mono_depth)
-    
-    return mono_depth_tensor  
+
+    return mono_depth_tensor
 
 def load_img_feature(idx,path,suffix=''):
     # image features
     feat_path = f"{path}/mono_priors/features/{idx:05d}{suffix}.npy"
     feat = np.load(feat_path)
     feat_tensor = torch.from_numpy(feat)
-    
-    return feat_tensor  
+
+    return feat_tensor
 
 
 def get_dataset(cfg, device='cuda:0'):
@@ -160,21 +160,21 @@ class BaseDataset(Dataset):
         intrinsic[0] *= W_out_with_edge / self.W
         intrinsic[1] *= H_out_with_edge / self.H
         intrinsic[2] *= W_out_with_edge / self.W
-        intrinsic[3] *= H_out_with_edge / self.H   
+        intrinsic[3] *= H_out_with_edge / self.H
         if self.W_edge > 0:
             intrinsic[2] -= self.W_edge
         if self.H_edge > 0:
-            intrinsic[3] -= self.H_edge   
-        return intrinsic 
-    
+            intrinsic[3] -= self.H_edge
+        return intrinsic
+
     def get_intrinsic_full_resol(self):
         intrinsic = torch.as_tensor([self.fx_orig, self.fy_orig, self.cx_orig, self.cy_orig]).float()
         if self.W_edge > 0:
             intrinsic[2] -= self.W_edge_full
         if self.H_edge > 0:
             intrinsic[3] -= self.H_edge_full
-        return intrinsic 
-    
+        return intrinsic
+
     def get_color_full_resol(self,index):
         # not used now
         color_path = self.color_paths[index]
@@ -413,7 +413,7 @@ class TUM_RGBD(BaseDataset):
         self.w2c_first_pose = inv_pose
 
         return images, depths, poses
-    
+
     def correct_gt_pose_bonn(self, T):
         """Specific operation for Bonn dynamic dataset"""
         Tm = np.array([[1.0157, 0.1828, -0.2389, 0.0113],
@@ -430,12 +430,12 @@ class TUM_RGBD(BaseDataset):
 
     def pose_matrix_from_quaternion(self, pvec):
         """ convert 4x4 pose matrix to (t, q) """
-   
+
         pose = np.eye(4)
         pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
         pose[:3, 3] = pvec[:3]
         return pose
-    
+
     def save_gt_poses(self, path, poses):
         # convert rotation matrix to quaternions, save to txt file
         idx = 0
@@ -587,6 +587,109 @@ class Dycheck(BaseDataset):
 
         return c2w_mats
 
+class RawSLAMParser:
+    def __init__(self, input_folder, is_raw=False):
+        self.input_folder = input_folder
+        self.is_raw = is_raw
+        self.load_poses(self.input_folder)
+        self.get_filepaths()
+        self.n_img = len(self.color_paths)
+
+    def load_poses(self, datapath):
+        pose_list = os.path.join(datapath, "groundtruth.txt")
+        if not os.path.exists(pose_list):
+            raise FileNotFoundError(f"No gt file found in {datapath}")
+
+        # 1. Cargar datos crudos (Saltando cabecera)
+        # Formato: [frame_idx, time, x, y, z, rotx, roty, rotz]
+        pose_data = np.loadtxt(pose_list, delimiter=" ", dtype=np.str_, skiprows=1)
+        pose_vecs = pose_data[:, 2:].astype(np.float64)
+
+        # 2. Convertir a matrices 4x4 Camera-to-World (c2w) GLOBALES
+        all_c2w_mats = []
+        for vec in pose_vecs:
+            pose_mat = np.eye(4)
+            translation = vec[:3]
+            euler_angles_deg = vec[3:]
+            # RawSLAM usa Euler xyz en grados
+            rotation = Rotation.from_euler('xyz', euler_angles_deg, degrees=True)
+            pose_mat[:3, :3] = rotation.as_matrix()
+            pose_mat[:3, 3] = translation
+            all_c2w_mats.append(pose_mat)
+
+        # 3. HACER RELATIVAS (Igual que hace el cargador de TUM)
+        # Esto es lo que hace que el RMSE baje de 1700 a 0
+        self.poses = []
+        inv_first_pose = np.linalg.inv(all_c2w_mats[0])
+
+        for i in range(len(all_c2w_mats)):
+            # T_relativa = inv(T_primera) @ T_actual
+            # Resultado: La primera pose será la Identidad (0,0,0...)
+            c2w_rel = inv_first_pose @ all_c2w_mats[i]
+
+            # GUARDAMOS LA MATRIZ 4x4 (No el vector 7D)
+            # Esto es lo que permite que eval_traj.py funcione sin cambios
+            self.poses.append(c2w_rel.astype(np.float32))
+
+        print(f"INFO RawSLAM: loaded {len(self.poses)} matrices 4x4 relativas.")
+
+    def get_filepaths(self):
+        groundtruth_file = os.path.join(self.input_folder, 'groundtruth.txt')
+        with open(groundtruth_file, 'r') as f:
+            lines = f.readlines()
+
+        subfolder = 'raw_linear_sRGB' if self.is_raw else 'sRGB'
+        image_dir = os.path.join(self.input_folder, subfolder)
+        depth_dir = os.path.join(self.input_folder, 'depth')
+
+        print(f"DEBUG RawSLAM: image_dir={image_dir}")
+        print(f"DEBUG RawSLAM: depth_dir={depth_dir}")
+
+        self.color_paths, self.depth_paths = [], []
+        for line_idx, line in enumerate(lines[1:]):
+            frame_name = line.strip().split()[0] + '.png'
+            color_path = os.path.join(image_dir, frame_name)
+            depth_path = os.path.join(depth_dir, frame_name)
+            self.color_paths.append(color_path)
+            self.depth_paths.append(depth_path)
+
+            if line_idx < 3:
+                print(
+                    f"DEBUG RawSLAM: frame={frame_name} | "
+                    f"color_exists={os.path.exists(color_path)} | "
+                    f"depth_exists={os.path.exists(depth_path)}"
+                )
+                print(f"DEBUG RawSLAM: color_path={color_path}")
+                print(f"DEBUG RawSLAM: depth_path={depth_path}")
+
+        print(f"DEBUG RawSLAM: loaded {len(self.color_paths)} color paths and {len(self.depth_paths)} depth paths")
+
+class RawSLAM(BaseDataset):
+    def __init__(self, cfg, device='cuda:0'):
+        super(RawSLAM, self).__init__(cfg, device)
+
+        # Verificamos si se solicita RAW desde la config
+        is_raw = cfg.get('raw', False)
+
+        parser = RawSLAMParser(self.input_folder, is_raw=is_raw)
+
+        stride = cfg['stride']
+        max_frames = cfg['max_frames']
+        if max_frames < 0:
+            max_frames = len(parser.color_paths)
+
+        self.color_paths = parser.color_paths[:max_frames][::stride]
+        self.depth_paths = parser.depth_paths[:max_frames][::stride]
+        self.poses = parser.poses[:max_frames][::stride]
+
+        self.n_img = len(self.color_paths)
+        print(f"INFO: RawSLAM dataset initialized with {self.n_img} images.")
+        print(f"DEBUG RawSLAM: poses={len(self.poses)} | colors={len(self.color_paths)} | depths={len(self.depth_paths)}")
+        if self.n_img > 0:
+            print(f"DEBUG RawSLAM: first selected color={self.color_paths[0]}")
+            print(f"DEBUG RawSLAM: first selected depth={self.depth_paths[0]}")
+            print(f"DEBUG RawSLAM: first selected pose={self.poses[0]}")
+
 
 dataset_dict = {
     "tumrgbd": TUM_RGBD,
@@ -594,4 +697,5 @@ dataset_dict = {
     "youtube": RGB_NoPose,
     "dycheck": Dycheck,
     "droidw": RGB_NoPose,
+    "rawslam": RawSLAM,
 }

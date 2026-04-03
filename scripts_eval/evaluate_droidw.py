@@ -17,19 +17,65 @@ from evo.tools import plot
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
-def align_traj(ref_traj_path, est_traj_path, plot_name="traj_error", plot_parent_dir="plots"):
+
+def load_and_relativize_rawslam_gt(path):
+    """
+    Carga el groundtruth.txt original de RawSLAM y lo convierte
+    al sistema de coordenadas relativo (empezando en 0,0,0)
+    """
+    # Cargar datos (saltando la cabecera si existe)
+    try:
+        raw = np.loadtxt(path, skiprows=1)
+    except Exception:
+        raw = np.loadtxt(path)
+
+    timestamps = raw[:, 0]
+    # x, y, z, rx, ry, rz (Euler grados)
+    poses_raw = raw[:, 2:]
+
+    first_c2w_inv = None
+    rel_poses = []
+
+    for i in range(len(poses_raw)):
+        # 1. Construir matriz Camera-to-World global
+        c2w = np.eye(4)
+        c2w[:3, 3] = poses_raw[i, :3]
+        rot = Rotation.from_euler('xyz', poses_raw[i, 3:], degrees=True)
+        c2w[:3, :3] = rot.as_matrix()
+
+        if i == 0:
+            first_c2w_inv = np.linalg.inv(c2w)
+
+        # 2. Hacerla relativa a la primera pose (empezar en Identidad)
+        c2w_rel = first_c2w_inv @ c2w
+
+        # 3. Extraer Traslación y Quaternions [x, y, z, qx, qy, qz, qw]
+        t = c2w_rel[:3, 3]
+        q = Rotation.from_matrix(c2w_rel[:3, :3]).as_quat()
+
+        # Guardar en formato 1 + 7 columnas (timestamp + pose)
+        rel_poses.append(np.concatenate([[timestamps[i]], t, q]))
+
+    return np.array(rel_poses)
+
+
+def align_traj(ref_traj_path, est_traj_path, plot_name="traj_error", plot_parent_dir="plots", is_rawslam=False):
     if not os.path.exists(ref_traj_path):
         print(f"Reference trajectory file not found: {ref_traj_path}")
         return
     if not os.path.exists(est_traj_path):
         print(f"Estimated trajectory file not found: {est_traj_path}")
         return
-    ref_file = np.loadtxt(ref_traj_path)
+    if is_rawslam:
+        print(f"Relativizing RawSLAM GT in memory for {ref_traj_path}...")
+        ref_file = load_and_relativize_rawslam_gt(ref_traj_path)
+    else:
+        ref_file = np.loadtxt(ref_traj_path)
     est_file = np.loadtxt(est_traj_path)
 
     traj_SE3_est = est_file[:, 1:8]
     traj_SE3_ref = ref_file[:, 1:8]
-    
+
     timestamps_est = est_file[:, 0]
     timestamps_ref = ref_file[:, 0]
 
@@ -69,7 +115,7 @@ def align_traj(ref_traj_path, est_traj_path, plot_name="traj_error", plot_parent
     plot.traj(ax, plot_mode, traj_ref, '--', 'gray', 'reference')
     plot.traj_colormap(
     ax, traj_est, ape_metric.error, plot_mode, min_map=ape_statistics["min"],
-    max_map=ape_statistics["max"], 
+    max_map=ape_statistics["max"],
     title="Downtown " + plot_name[-1])
     # title="APE mapped onto trajectory, RMSE: %.2f m" % (ape_statistics["rmse"]))
     # set everything to bold and all use serif font
@@ -105,8 +151,9 @@ def align_traj(ref_traj_path, est_traj_path, plot_name="traj_error", plot_parent
 
     return ape_statistics
 
-def main(base_dir: str):
+def main(base_dir: str, is_rawslam):
     gt_dir = "./datasets/DROID-W"
+    if
     scene_list = sorted(os.listdir(base_dir))
     print(f'Evaluating {len(scene_list)} scenes...')
     for scene_name in scene_list:
@@ -141,7 +188,7 @@ def main(base_dir: str):
                 # remove the scene_name folder
                 if os.path.exists(os.path.join(save_path, scene_name)):
                     shutil.rmtree(os.path.join(save_path, scene_name))
-            align_traj(gt_seq_txt, outputfile, "traj_" + scene_name, save_path)
+            align_traj(gt_seq_txt, outputfile, "traj_" + scene_name, save_path, is_rawslam)
 
 
 if __name__ == "__main__":
@@ -153,5 +200,11 @@ if __name__ == "__main__":
         default="./Outputs/DROID-W",
         help="Base directory containing per-scene outputs.",
     )
+    parser.add_argument(
+        "--is_rawslam",
+        type=bool,
+        default=False,
+        help="Base directory containing per-scene outputs.",
+    )
     args = parser.parse_args()
-    main(args.base_dir)
+    main(args.base_dir, args.is_rawslam)
