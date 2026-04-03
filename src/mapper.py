@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -19,6 +20,7 @@ from multiprocessing.connection import Connection
 import torch.multiprocessing as mp
 
 from thirdparty.gaussian_splatting.utils.image_utils import psnr
+from thirdparty.gaussian_splatting.utils.loss_utils import ssim
 from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
 from thirdparty.gaussian_splatting.gaussian_renderer import render
 from thirdparty.gaussian_splatting.utils.general_utils import (
@@ -56,7 +58,7 @@ class Mapper(object):
     """
 
     def __init__(
-        self, slam, pipe: Connection, 
+        self, slam, pipe: Connection,
         q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
     ):
         # setup seed
@@ -69,6 +71,16 @@ class Mapper(object):
         self.verbose = slam.verbose
         self.device = torch.device(self.config["device"])
         self.video: DepthVideo = slam.video
+
+        self.lpips_fn = None
+        try:
+            import lpips
+            self.lpips_fn = lpips.LPIPS(net="alex").to(self.device).eval()
+        except Exception as e:
+            self.printer.print(
+                f"LPIPS model unavailable, skipping LPIPS render metric: {e}",
+                FontColor.INFO,
+            )
 
         # Set gaussian model
         self.model_params = munchify(self.config["mapping"]["model_params"])
@@ -768,7 +780,7 @@ class Mapper(object):
             window.remove(removed_frame)
 
         return window, removed_frame
-    
+
     def _send_to_gui(self, video_idx):
         """Send data to the GUI for visualization.
         """
@@ -776,7 +788,7 @@ class Mapper(object):
         keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
         uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
         uncertainty_map = uncertainty_map.cpu().squeeze(0).numpy()
-        
+
         current_window_dict = {}
         current_window_dict[self.current_window[0]] = self.current_window[1:]
         keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
@@ -1231,7 +1243,7 @@ class Mapper(object):
 
         if self.vis_uncertainty_online:
             self._vis_uncertainty_mask_all(is_final=True)
-        
+
         if self.config['gui']:
             self._send_to_gui(self.current_window[np.array(self.current_window).argmax()])
 
@@ -1307,7 +1319,7 @@ class Mapper(object):
         return mask
 
     @torch.no_grad()
-    def save_fig_everything(self, keyframe_idx: int, plot_dir: str, suffix: str = "", depth_max: float = 10.0):
+    def save_fig_everything(self, keyframe_idx: int, plot_dir: str, suffix: str = "", depth_max: float = 10.0, save_outputs: bool = True):
         """
         Saves various visualizations for a specific keyframe.
 
@@ -1348,11 +1360,32 @@ class Mapper(object):
         psnr_score = psnr(
             (rendered_img[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)
         )
+        ssim_score = ssim(rendered_img.unsqueeze(0), gt_image.unsqueeze(0))
+
+        lpips_score = None
+        if self.lpips_fn is not None:
+            rendered_img_norm = rendered_img.unsqueeze(0) * 2.0 - 1.0
+            gt_image_norm = gt_image.unsqueeze(0) * 2.0 - 1.0
+            lpips_score = self.lpips_fn(rendered_img_norm, gt_image_norm).mean()
+
         diff_rgb=np.abs(gt - pred)
         diff_depth_l1 = torch.abs(rendered_depth.detach().cpu() - gt_depth)
         diff_depth_l1 = diff_depth_l1 * (gt_depth > 0)
         depth_l1 = diff_depth_l1.sum() / (gt_depth > 0).sum()
         diff_depth_l1 = diff_depth_l1.cpu().squeeze(0)
+
+        frame_idx = int(self.video.timestamp[keyframe_idx])
+        metric_dict = {
+            "psnr": float(psnr_score.item()),
+            "ssim": float(ssim_score.item()),
+            "lpips": float(lpips_score.item()) if lpips_score is not None else None,
+            "depth_l1": float(depth_l1.item()),
+            "video_idx": int(keyframe_idx),
+            "frame_idx": int(frame_idx),
+        }
+
+        if not save_outputs:
+            return metric_dict
 
         if self.uncertainty_aware:
             # Add plotting 2x4 grid with additional figures for uncertainty
@@ -1403,18 +1436,17 @@ class Mapper(object):
         axs[0, 2].set_title(f"Diff RGB L1, vmax:{diff_rgb.max():.2f}", fontsize=16)
         axs[1, 2].imshow(diff_depth_l1, cmap='jet', vmin=0, vmax=depth_max/5.0)
         axs[1, 2].set_title(f"Diff Depth L1, vmax:{depth_max/5.0:.2f}", fontsize=16)
-        
+
         axs[0, 3].imshow(uncertainty_map, cmap='jet', vmin=0, vmax=1)
         axs[0, 3].set_title("Uncertainty", fontsize=16)
         axs[1, 3].imshow(ssim_loss, cmap='jet', vmin=0, vmax=5)
         axs[1, 3].set_title("ssim_loss", fontsize=16)
-        
+
         for i in range(2):
             for j in range(4):
                 axs[i, j].axis('off')
                 axs[i, j].grid(False)
 
-        frame_idx = int(self.video.timestamp[keyframe_idx])
         fig.suptitle(f"Key Frame idx ({keyframe_idx}), Frame idx ({frame_idx}), Plot{suffix}", y=0.95, fontsize=20)
         fig.tight_layout()
 
@@ -1445,11 +1477,13 @@ class Mapper(object):
             )
         )
 
+        return metric_dict
+
     def save_all_kf_figs(
         self,
         save_dir: str,
         iteration: Union[str, float] ="after_refine",
-    ): 
+    ):
         """
         Save figures for all keyframes in the specified directory.
 
@@ -1458,29 +1492,63 @@ class Mapper(object):
 
         Args:
             save_dir (str): The base directory where figures will be saved.
-            iteration (Union[str, float]): A string or float representing the 
-                                        iteration or stage of the process. 
+            iteration (Union[str, float]): A string or float representing the
+                                        iteration or stage of the process.
                                         Default is "after_refine".
         """
-        video_idxs = list(self.video_idxs)
+        all_video_idxs = list(self.video_idxs)
+        save_video_idxs = list(all_video_idxs)
         max_saved_plots = int(self.config.get("mapping", {}).get("max_saved_plots_per_scene", 10))
-        if max_saved_plots > 0 and len(video_idxs) > max_saved_plots:
+        if max_saved_plots > 0 and len(save_video_idxs) > max_saved_plots:
             # Uniformly sample keyframes so visual summaries stay compact.
             if max_saved_plots == 1:
-                sampled_idxs = [video_idxs[-1]]
+                sampled_idxs = [save_video_idxs[-1]]
             else:
-                n = len(video_idxs)
+                n = len(save_video_idxs)
                 sampled_positions = [
                     (i * (n - 1)) // (max_saved_plots - 1) for i in range(max_saved_plots)
                 ]
-                sampled_idxs = [video_idxs[pos] for pos in sampled_positions]
-            video_idxs = sampled_idxs
+                sampled_idxs = [save_video_idxs[pos] for pos in sampled_positions]
+            save_video_idxs = sampled_idxs
+
+        save_video_idx_set = set(save_video_idxs)
 
         plot_dir = os.path.join(save_dir, "plots_" + iteration)
         mkdir_p(plot_dir)
-        # add tqdm progress bar
-        for kf_idx in tqdm(video_idxs, desc="Visualizing Gaussian Splatting mapping results", total=len(video_idxs)):
-            self.save_fig_everything(kf_idx, plot_dir)
+        psnr_array, ssim_array, lpips_array, depth_l1_array = [], [], [], []
+
+        # Evaluate metrics on all keyframes, save images only for sampled keyframes.
+        for kf_idx in tqdm(all_video_idxs, desc="Visualizing Gaussian Splatting mapping results", total=len(all_video_idxs)):
+            metric = self.save_fig_everything(
+                kf_idx,
+                plot_dir,
+                save_outputs=(kf_idx in save_video_idx_set),
+            )
+            psnr_array.append(metric["psnr"])
+            ssim_array.append(metric["ssim"])
+            depth_l1_array.append(metric["depth_l1"])
+            if metric["lpips"] is not None:
+                lpips_array.append(metric["lpips"])
+
+        render_metrics = {
+            "iteration": str(iteration),
+            "num_frames_evaluated": int(len(all_video_idxs)),
+            "num_frames_saved": int(len(save_video_idxs)),
+            "mean_psnr": float(np.mean(psnr_array)) if len(psnr_array) > 0 else None,
+            "mean_ssim": float(np.mean(ssim_array)) if len(ssim_array) > 0 else None,
+            "mean_lpips": float(np.mean(lpips_array)) if len(lpips_array) > 0 else None,
+            "depth_l1": float(np.mean(depth_l1_array)) if len(depth_l1_array) > 0 else None,
+        }
+
+        metrics_json_path = os.path.join(plot_dir, "render_metrics_summary.json")
+        with open(metrics_json_path, "w") as f:
+            json.dump(render_metrics, f, indent=2)
+
+        self.printer.print(
+            f"Saved render metric summary to {metrics_json_path}",
+            FontColor.EVAL,
+        )
+
         print("Visualizing Gaussian Splatting mapping results done")
         # Create gif
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', online=True)
