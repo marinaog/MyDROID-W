@@ -55,14 +55,14 @@ def get_loss_tracking(config, image, depth, opacity, viewpoint, monocular=True, 
 def get_loss_tracking_rgb(config, image, opacity, viewpoint, uncertainty=None):
     """Compute RGB tracking loss between rendered and ground truth images.
     This function adds uncertainty mask on the original function from MonoGS
-    
+
     Args:
         config: Configuration dictionary containing training parameters
         image: Rendered RGB image tensor (3, H, W)
-        opacity: Opacity tensor (1, H, W) 
+        opacity: Opacity tensor (1, H, W)
         viewpoint: Camera object containing ground truth image and gradient mask
         uncertainty: Optional uncertainty estimates (H, W)
-    
+
     Returns:
         Scalar loss tensor
     """
@@ -75,16 +75,29 @@ def get_loss_tracking_rgb(config, image, opacity, viewpoint, uncertainty=None):
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
 
-    # Compute L1 loss weighted by opacity
-    l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    if uncertainty is not None:
-        # Weight loss inversely proportional to uncertainty
-        # Higher uncertainty -> lower weight 
-        # Zero out weights below 0.1 to ignore highly uncertain regions (Todo: verify this is useful)
-        weights = 0.5 / (uncertainty.unsqueeze(0))**2
-        weights = torch.where(weights < 0.1, 0.0, weights)
-        l1 *= weights
-    return l1.mean()
+    if config.get("raw"):
+        print('[CHECK] clamping in src.utils.slam_utils.py')
+        image = torch.clamp(image, max=1.0)
+
+    if config.get("loss") and config["loss"] == "rawnerf":
+            resid_sq_clip = (image - gt_image) ** 2
+            resid_sq_clip_masked = resid_sq_clip * rgb_pixel_mask
+            # Scale by gradient of log tonemapping curve.
+            scaling_grad = 1.0 / (image.detach() + 1e-2)
+            # Reweighted L2 loss.
+            loss_rgb = (resid_sq_clip_masked * scaling_grad**2)
+
+    # Compute L1 loss weighted by opacity as default and original
+    else:
+        loss_rgb = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+        if uncertainty is not None:
+            # Weight loss inversely proportional to uncertainty
+            # Higher uncertainty -> lower weight
+            # Zero out weights below 0.1 to ignore highly uncertain regions (Todo: verify this is useful)
+            weights = 0.5 / (uncertainty.unsqueeze(0))**2
+            weights = torch.where(weights < 0.1, 0.0, weights)
+            loss_rgb *= weights
+    return loss_rgb1.mean()
 
 # Not used, but kept for reference
 def get_loss_tracking_rgbd(
@@ -125,17 +138,31 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint):
     )[
         None
     ]
+
+    if config.get("raw"):
+        image = torch.clamp(image, max=1.0)
+
     loss = 0
     if config["Training"]["ssim_loss"]:
         ssim_loss = 1.0 - ssim(image, gt_image)
 
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+
+    if config.get("loss") and config["loss"] == "rawnerf":
+            resid_sq_clip = (image - gt_image) ** 2
+            resid_sq_clip_masked = resid_sq_clip * rgb_pixel_mask
+            # Scale by gradient of log tonemapping curve.
+            scaling_grad = 1.0 / (image.detach() + 1e-2)
+            # Reweighted L2 loss.
+            loss_rgb = (resid_sq_clip_masked * scaling_grad**2)
+    else:
+        loss_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+
     if config["Training"]["ssim_loss"]:
         hyperparameter = config["opt_params"]["lambda_dssim"]
-        loss += (1.0 - hyperparameter) * l1_rgb + hyperparameter * ssim_loss
+        loss += (1.0 - hyperparameter) * loss_rgb + hyperparameter * ssim_loss
     else:
-        loss += l1_rgb
+        loss += loss_rgb
 
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
@@ -175,6 +202,10 @@ def get_loss_mapping_uncertainty(
         torch.exp(viewpoint.exposure_a) * rendered_img + viewpoint.exposure_b
     )
 
+    # Clamp if raw
+    if config.get("raw"):
+        image = torch.clamp(image, max=1.0)
+
     # Config parameters
     alpha = config["Training"].get("alpha", 0.95)
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
@@ -192,15 +223,23 @@ def get_loss_mapping_uncertainty(
     # SSIM loss (same as get_loss_mapping_uncertainty)
     ssim_loss = 1.0 - ssim(rendered_img, gt_img) if config["Training"]["ssim_loss"] else 0.0
 
-    # RGB L1 loss
-    l1_rgb = torch.abs(rendered_img * rgb_pixel_mask - gt_img * rgb_pixel_mask)
+    # RGB loss
+    if config.get("loss") and config["loss"] == "rawnerf":
+            resid_sq_clip = (rendered_img - gt_img) ** 2
+            resid_sq_clip_masked = resid_sq_clip * rgb_pixel_mask
+            # Scale by gradient of log tonemapping curve.
+            scaling_grad = 1.0 / (rendered_img.detach() + 1e-2)
+            # Reweighted L2 loss.
+            loss_rgb = (resid_sq_clip_masked * scaling_grad**2)
+    else:
+        loss_rgb = torch.abs(rendered_img * rgb_pixel_mask - gt_img * rgb_pixel_mask)
 
     # Combine RGB losses
     if config["Training"]["ssim_loss"]:
         lambda_dssim = config["opt_params"]["lambda_dssim"]
-        rgb_loss = (1.0 - lambda_dssim) * l1_rgb + lambda_dssim * ssim_loss
+        rgb_loss = (1.0 - lambda_dssim) * loss_rgb + lambda_dssim * ssim_loss
     else:
-        rgb_loss = l1_rgb
+        rgb_loss = loss_rgb
 
     # Resize mask to image resolution → shape (1, H, W) to broadcast over channels
     if uncertainty_mask.shape != (h, w):

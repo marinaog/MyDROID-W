@@ -1,0 +1,40 @@
+inherit_from: ./configs/rawslam/rawslam.yaml
+scene: small_city
+raw: True
+use_mlp: True
+
+data:
+  input_folder: ROOT_FOLDER_PLACEHOLDER/small_city
+cam:  #intrinsic is different per scene in TUM, this cam does not have distortion
+  H: 480
+  W: 640
+  fx: 520.9
+  fy: 521.0
+  cx: 325.1
+  cy: 249.7
+  distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+tracking:
+  # This sequence is too long
+  force_keyframe_every_n_frames: -1
+
+
+mlp_opt_params:
+  feature_lr_mlp_bias: 1e-4
+  feature_lr_mlp_feat: 2e-3
+  color_mlp_opt:
+    type: TinyColorMLP
+    in_feats: 16
+    dir_feats: 3
+    act: relu
+    mid_feats_list: [16]
+    out_feats: 3
+    final_bias: ~
+    final_act: torch.exp
+  optim_color_mlp:
+    lr: 1.0e-4
+    weight_decay: 0
+    betas: [0.9, 0.999]
+  color_feat_opt:
+    feat_len: 16
+    feat_init_sigma: 0.001

@@ -80,6 +80,7 @@ def predict_metric_depth(
     cfg: Dict,
     device: str,
     save_depth: bool = True,
+    save_path: str = None,
 ) -> torch.Tensor:
     """
     Predict metric depth using the given model.
@@ -110,7 +111,7 @@ def predict_metric_depth(
         raise NotImplementedError("Unsupported depth model")
 
     if save_depth:
-        _save_depth_map(output, cfg, idx)
+        _save_depth_map(output, save_path, idx)
 
     return output
 
@@ -156,8 +157,8 @@ def _predict_metric3d_depth(
     return torch.clamp(pred_depth, 0, 300)
 
 
-def _save_depth_map(depth_map: torch.Tensor, cfg: Dict, idx: int) -> None:
-    output_dir = f"{cfg['data']['output']}/{cfg['scene']}"
+def _save_depth_map(depth_map: torch.Tensor, output: str, idx: int) -> None:
+    output_dir = output
     output_path = f"{output_dir}/mono_priors/depths/{idx:05d}.npy"
     final_depth = depth_map.detach().cpu().float().numpy()
     np.save(output_path, final_depth)

@@ -50,6 +50,7 @@ from src.gui import gui_utils
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib import cm
+from pathlib import Path
 
 class Mapper(object):
     """
@@ -59,7 +60,7 @@ class Mapper(object):
 
     def __init__(
         self, slam, pipe: Connection,
-        q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
+        q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None, save_dir: str = None
     ):
         # setup seed
         setup_seed(slam.cfg["setup_seed"])
@@ -71,6 +72,8 @@ class Mapper(object):
         self.verbose = slam.verbose
         self.device = torch.device(self.config["device"])
         self.video: DepthVideo = slam.video
+        self.save_dir = save_dir
+        self.raw = self.config.get("raw")
 
         self.lpips_fn = None
         try:
@@ -90,7 +93,7 @@ class Mapper(object):
             "spherical_harmonics"
         ]
         self.model_params.sh_degree = 3 if use_spherical_harmonics else 0
-        self.gaussians = GaussianModel(self.model_params.sh_degree, config=self.config)
+        self.gaussians = GaussianModel(self.model_params.sh_degree, config=self.config, dataset=self.config.get("dataset"), raw=self.raw, use_mlp=self.config.get("use_mlp"))
         self.gaussians.init_lr(6.0)
         self.gaussians.training_setup(self.opt_params)
 
@@ -350,7 +353,6 @@ class Mapper(object):
         self.size_threshold = mapping_config["Training"]["size_threshold"]
         self.window_size = mapping_config["Training"]["window_size"]
 
-        self.save_dir = self.config["data"]["output"] + "/" + self.config["scene"]
 
         self.deform_gaussians = self.config["mapping"]["deform_gaussians"]
         self.online_plotting = self.config["mapping"]["online_plotting"]
@@ -1208,6 +1210,8 @@ class Mapper(object):
                 depth = F.interpolate(
                     depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
                 ).squeeze(0)
+            if self.raw:
+                image = torch.clamp(image, max=1.0)
             if not self.uncertainty_aware:
                 loss_mapping += get_loss_mapping(
                     self.config["mapping"], image, depth, viewpoint, opacity
@@ -1308,6 +1312,38 @@ class Mapper(object):
         return ssim_loss
 
     @torch.no_grad()
+    def raw2normal(self, img, is_torch=False):
+        if is_torch:
+            bright_factor = 0.98 / torch.quantile(img, 0.99)
+            img = torch.clamp(img * bright_factor, 0.0, 1.0)
+
+            gamma = 2.4
+            slope = 12.92
+            threshold = 0.04045 / slope
+
+            out = torch.zeros_like(img)
+            low = img <= threshold
+            high = img > threshold
+
+            out[low] = img[low] * slope
+            out[high] = 1.055 * torch.pow(img[high], 1.0 / gamma) - 0.055
+
+        else:
+            bright_factor = 0.98 / (np.percentile(img, 99) + 1e-6)
+            img = np.clip(img * bright_factor, 0, 1)
+
+            gamma = 2.4
+            slope = 12.92
+            threshold = (0.04045 / slope)
+            low = img <= threshold
+            high = img > threshold
+            out = np.zeros_like(img)
+
+            out[low] = img[low] * slope
+            out[high] = 1.055 * (img[high] ** (1/gamma)) - 0.055
+        return out
+
+    @torch.no_grad()
     def get_viewpoint_uncertainty_no_grad(self, viewpoint: Camera) -> torch.Tensor:
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
@@ -1350,13 +1386,43 @@ class Mapper(object):
         gt_depth = viewpoint.depth
 
         rendered_img = torch.clamp(rendered_img, 0.0, 1.0)
-        gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
-        pred = (rendered_img.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
-            np.uint8
-        )
+        mask = gt_image > 0
+
+        plot_dir = Path(plot_dir)
+
+
+        if self.raw:
+            (plot_dir / "rendered_raw_images").mkdir(parents=True, exist_ok=True)
+            (plot_dir / "gt_raw_images").mkdir(parents=True, exist_ok=True)
+
+            gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 65535).astype(np.uint16)
+            pred = (rendered_img.detach().cpu().numpy().transpose((1, 2, 0)) * 65535).astype(np.uint16)
+
+            # Compute PSNR in RAW space
+            psnr_raw_score = psnr((rendered_img[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
+
+            # Compute SSIM in RAW space
+            ssim_raw_score = ssim((rendered_img).unsqueeze(0), (gt_image).unsqueeze(0))
+
+
+            # Save RAW images
+            gt_raw = cv2.cvtColor(gt, cv2.COLOR_RGB2BGR)
+            pred_raw = cv2.cvtColor(pred, cv2.COLOR_RGB2BGR)
+
+            # Convert RAW to sRGB for normal evaluation
+            gt = (self.raw2normal(gt.astype(np.uint16)) * 255).astype(np.uint8)
+            pred = (self.raw2normal(pred.astype(np.uint16)) * 255).astype(np.uint8)
+
+            rendered_img = self.raw2normal(rendered_img, is_torch=True)
+            gt_image = self.raw2normal(gt_image, is_torch=True)
+            mask = gt_image > 0
+
+        else:
+            gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+            pred = (rendered_img.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+
         gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
         pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
-        mask = gt_image > 0
         psnr_score = psnr(
             (rendered_img[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)
         )
@@ -1383,9 +1449,18 @@ class Mapper(object):
             "video_idx": int(keyframe_idx),
             "frame_idx": int(frame_idx),
         }
+        if self.raw:
+            # Keep raw-space metrics available for all evaluated frames, even
+            # when image outputs are skipped by frame sampling.
+            metric_dict["psnr_raw"] = float(psnr_raw_score.item())
+            metric_dict["ssim_raw"] = float(ssim_raw_score.item())
 
         if not save_outputs:
             return metric_dict
+
+        if self.raw:
+            cv2.imwrite(str(plot_dir / "rendered_raw_images" / f'raw_rendered_video_idx_{keyframe_idx:05d}_kf_idx_{frame_idx}.png'), pred_raw)
+            cv2.imwrite(str(plot_dir / "gt_raw_images" / f'raw_gt_video_idx_{keyframe_idx:05d}_kf_idx_{frame_idx}.png'), gt_raw)
 
         if self.uncertainty_aware:
             # Add plotting 2x4 grid with additional figures for uncertainty
@@ -1516,6 +1591,8 @@ class Mapper(object):
         plot_dir = os.path.join(save_dir, "plots_" + iteration)
         mkdir_p(plot_dir)
         psnr_array, ssim_array, lpips_array, depth_l1_array = [], [], [], []
+        if self.raw:
+            psnr_array_raw, ssim_array_raw = [], []
 
         # Evaluate metrics on all keyframes, save images only for sampled keyframes.
         for kf_idx in tqdm(all_video_idxs, desc="Visualizing Gaussian Splatting mapping results", total=len(all_video_idxs)):
@@ -1529,6 +1606,9 @@ class Mapper(object):
             depth_l1_array.append(metric["depth_l1"])
             if metric["lpips"] is not None:
                 lpips_array.append(metric["lpips"])
+            if self.raw:
+                psnr_array_raw.append(metric["psnr_raw"])
+                ssim_array_raw.append(metric["ssim_raw"])
 
         render_metrics = {
             "iteration": str(iteration),
@@ -1539,6 +1619,10 @@ class Mapper(object):
             "mean_lpips": float(np.mean(lpips_array)) if len(lpips_array) > 0 else None,
             "depth_l1": float(np.mean(depth_l1_array)) if len(depth_l1_array) > 0 else None,
         }
+
+        if self.raw:
+            render_metrics["mean_psnr_raw"] = float(np.mean(psnr_array_raw)) if len(psnr_array_raw) > 0 else None
+            render_metrics["mean_ssim_raw"] = float(np.mean(ssim_array_raw)) if len(ssim_array_raw) > 0 else None
 
         metrics_json_path = os.path.join(plot_dir, "render_metrics_summary.json")
         with open(metrics_json_path, "w") as f:

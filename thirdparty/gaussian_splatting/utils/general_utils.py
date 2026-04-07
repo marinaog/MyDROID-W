@@ -93,6 +93,11 @@ def helper(
     log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
     return delay_rate * log_lerp
 
+def get_cosine_lr(iteration, lr_init, lr_final, max_steps):
+    if iteration > max_steps:
+        return lr_final
+    t = iteration / max_steps
+    return lr_final + 0.5 * (lr_init - lr_final) * (1 + np.cos(np.pi * t))
 
 def strip_lowerdiag(L):
     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
@@ -165,13 +170,13 @@ def quaternion_multiply(q1, q2):
     # Extract components
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
     w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
-    
+
     # Compute the product
     w = w1*w2 - x1*x2 - y1*y2 - z1*z2
     x = w1*x2 + x1*w2 + y1*z2 - z1*y2
     y = w1*y2 + y1*w2 + z1*x2 - x1*z2
     z = w1*z2 + z1*w2 + x1*y2 - y1*x2
-    
+
     return torch.stack((w, x, y, z), dim=-1)
 
 def build_scaling_rotation(s, r):

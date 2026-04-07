@@ -77,6 +77,7 @@ class BaseDataset(Dataset):
         self.color_paths = None
         self.poses = None
         self.image_timestamps = None
+        self.is_raw = False
 
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = cfg['cam']['H'], cfg['cam'][
             'W'], cfg['cam']['fx'], cfg['cam']['fy'], cfg['cam']['cx'], cfg['cam']['cy']
@@ -133,7 +134,12 @@ class BaseDataset(Dataset):
 
     def get_color(self,index):
         color_path = self.color_paths[index]
-        color_data_fullsize = cv2.imread(color_path)
+
+        if self.is_raw:
+            color_data_fullsize = cv2.imread(color_path, cv2.IMREAD_UNCHANGED)
+        else:
+            color_data_fullsize = cv2.imread(color_path)
+
         if self.distortion is not None:
             K = np.eye(3)
             K[0, 0], K[0, 2], K[1, 1], K[1, 2] = self.fx_orig, self.cx_orig, self.fy_orig, self.cy_orig
@@ -141,7 +147,10 @@ class BaseDataset(Dataset):
             color_data_fullsize = cv2.undistort(color_data_fullsize, K, self.distortion)
 
         color_data = cv2.resize(color_data_fullsize, (self.W_out_with_edge, self.H_out_with_edge))
-        color_data = torch.from_numpy(color_data).float().permute(2, 0, 1)[[2, 1, 0], :, :] / 255.0  # bgr -> rgb, [0, 1]
+        if self.is_raw:
+            color_data = torch.from_numpy(color_data.astype(np.float32)).float().permute(2, 0, 1)[[2, 1, 0], :, :] / 65535.0
+        else:
+            color_data = torch.from_numpy(color_data).float().permute(2, 0, 1)[[2, 1, 0], :, :] / 255.0  # bgr -> rgb, [0, 1]
         color_data = color_data.unsqueeze(dim=0)  # [1, 3, h, w]
 
         # crop image edge, there are invalid value on the edge of the color image
@@ -178,14 +187,20 @@ class BaseDataset(Dataset):
     def get_color_full_resol(self,index):
         # not used now
         color_path = self.color_paths[index]
-        color_data_fullsize = cv2.imread(color_path)
+        if self.is_raw:
+            color_data_fullsize = cv2.imread(color_path, cv2.IMREAD_UNCHANGED)
+        else:
+            color_data_fullsize = cv2.imread(color_path)
         if self.distortion is not None:
             K = np.eye(3)
             K[0, 0], K[0, 2], K[1, 1], K[1, 2] = self.fx_orig, self.cx_orig, self.fy_orig, self.cy_orig
             # undistortion is only applied on color image, not depth!
             color_data_fullsize = cv2.undistort(color_data_fullsize, K, self.distortion)
 
-        color_data_fullsize = torch.from_numpy(color_data_fullsize).float().permute(2, 0, 1)[[2, 1, 0], :, :] / 255.0  # bgr -> rgb, [0, 1]
+        if self.is_raw:
+            color_data_fullsize = torch.from_numpy(color_data_fullsize.astype(np.float32)).float().permute(2, 0, 1)[[2, 1, 0], :, :] / 65535.0  # bgr -> rgb, [0, 1]
+        else:
+            color_data_fullsize = torch.from_numpy(color_data_fullsize).float().permute(2, 0, 1)[[2, 1, 0], :, :] / 255.0  # bgr -> rgb, [0, 1]
         color_data_fullsize = color_data_fullsize.unsqueeze(dim=0)  # [1, 3, h, w]
 
         # crop image edge, there are invalid value on the edge of the color image
@@ -642,8 +657,8 @@ class RawSLAMParser:
         image_dir = os.path.join(self.input_folder, subfolder)
         depth_dir = os.path.join(self.input_folder, 'depth')
 
-        print(f"DEBUG RawSLAM: image_dir={image_dir}")
-        print(f"DEBUG RawSLAM: depth_dir={depth_dir}")
+        #print(f"DEBUG RawSLAM: image_dir={image_dir}")
+        #print(f"DEBUG RawSLAM: depth_dir={depth_dir}")
 
         self.color_paths, self.depth_paths = [], []
         for line_idx, line in enumerate(lines[1:]):
@@ -653,16 +668,16 @@ class RawSLAMParser:
             self.color_paths.append(color_path)
             self.depth_paths.append(depth_path)
 
-            if line_idx < 3:
-                print(
-                    f"DEBUG RawSLAM: frame={frame_name} | "
-                    f"color_exists={os.path.exists(color_path)} | "
-                    f"depth_exists={os.path.exists(depth_path)}"
-                )
-                print(f"DEBUG RawSLAM: color_path={color_path}")
-                print(f"DEBUG RawSLAM: depth_path={depth_path}")
+            #if line_idx < 3:
+                #print(
+                #    f"DEBUG RawSLAM: frame={frame_name} | "
+                #    f"color_exists={os.path.exists(color_path)} | "
+                #    f"depth_exists={os.path.exists(depth_path)}"
+                #)
+                #print(f"DEBUG RawSLAM: color_path={color_path}")
+                #print(f"DEBUG RawSLAM: depth_path={depth_path}")
 
-        print(f"DEBUG RawSLAM: loaded {len(self.color_paths)} color paths and {len(self.depth_paths)} depth paths")
+        #print(f"DEBUG RawSLAM: loaded {len(self.color_paths)} color paths and {len(self.depth_paths)} depth paths")
 
 class RawSLAM(BaseDataset):
     def __init__(self, cfg, device='cuda:0'):
@@ -670,6 +685,12 @@ class RawSLAM(BaseDataset):
 
         # Verificamos si se solicita RAW desde la config
         is_raw = cfg.get('raw', False)
+        if is_raw:
+            if cfg.get('use_mlp', False):
+                print('📷 Using RAW data and MLP!')
+            else:
+                print('📷 Using RAW data!')
+        self.is_raw = is_raw
 
         parser = RawSLAMParser(self.input_folder, is_raw=is_raw)
 
@@ -684,11 +705,11 @@ class RawSLAM(BaseDataset):
 
         self.n_img = len(self.color_paths)
         print(f"INFO: RawSLAM dataset initialized with {self.n_img} images.")
-        print(f"DEBUG RawSLAM: poses={len(self.poses)} | colors={len(self.color_paths)} | depths={len(self.depth_paths)}")
-        if self.n_img > 0:
-            print(f"DEBUG RawSLAM: first selected color={self.color_paths[0]}")
-            print(f"DEBUG RawSLAM: first selected depth={self.depth_paths[0]}")
-            print(f"DEBUG RawSLAM: first selected pose={self.poses[0]}")
+        #print(f"DEBUG RawSLAM: poses={len(self.poses)} | colors={len(self.color_paths)} | depths={len(self.depth_paths)}")
+        #if self.n_img > 0:
+        #    print(f"DEBUG RawSLAM: first selected color={self.color_paths[0]}")
+        #    print(f"DEBUG RawSLAM: first selected depth={self.depth_paths[0]}")
+        #    print(f"DEBUG RawSLAM: first selected pose={self.poses[0]}")
 
 
 dataset_dict = {

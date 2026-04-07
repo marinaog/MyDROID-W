@@ -1,5 +1,5 @@
 from src.motion_filter import MotionFilter
-from src.frontend import Frontend 
+from src.frontend import Frontend
 from src.backend import Backend
 import torch
 from colorama import Fore, Style
@@ -22,11 +22,11 @@ class Tracker:
         self.pipe = pipe
         self.output = slam.save_dir
         self.event_writer = event_writer
-        
+
         # filter incoming frames so that there is enough motion
         self.frontend_window = self.cfg['tracking']['frontend']['window']
         filter_thresh = self.cfg['tracking']['motion_filter']['thresh']
-        self.motion_filter = MotionFilter(self.net, self.video, self.cfg, thresh=filter_thresh, device=self.device)
+        self.motion_filter = MotionFilter(self.net, self.video, self.cfg, thresh=filter_thresh, device=self.device, output = self.output)
         self.enable_online_ba = self.cfg['tracking']['frontend']['enable_online_ba']
         # frontend process
         self.frontend = Frontend(self.net, self.video, self.cfg)
@@ -45,10 +45,10 @@ class Tracker:
         '''
         Trigger the tracking process.
         1. check whether there is enough motion between the current frame and last keyframe by motion_filter
-        2. use frontend to do local bundle adjustment, to estimate camera pose and depth image, 
+        2. use frontend to do local bundle adjustment, to estimate camera pose and depth image,
             also delete the current keyframe if it is too close to the previous keyframe after local BA.
         3. run online global BA periodically by backend
-        4. send the estimated pose and depth to mapper, 
+        4. send the estimated pose and depth to mapper,
             and wait until the mapper finish its current mapping optimization.
         '''
         prev_kf_idx = 0
@@ -97,7 +97,7 @@ class Tracker:
 
                         except Exception as e:
                             self.printer.print(e, FontColor.ERROR)
-                        
+
                         self.prev_kf_counter = self.video.counter.value
 
                 if (starting_count < self.video.counter.value) and self.cfg['mapping']['full_resolution']:
@@ -105,7 +105,7 @@ class Tracker:
                         img_full = stream.get_color_full_resol(i)
                         self.motion_filter.get_img_feature(timestamp,img_full,suffix='full')
             curr_kf_idx = self.video.counter.value - 1
-            
+
             if curr_kf_idx != prev_kf_idx and self.frontend.is_initialized:
                 if self.video.counter.value == self.frontend.warmup:
                     # initialize the second stage of the frontend
@@ -113,7 +113,7 @@ class Tracker:
                     ## We just finish the initialization
                     if self.cfg['mapping']['enable']:
                         self.pipe.send({"is_keyframe":True, "video_idx":curr_kf_idx,
-                                        "timestamp":timestamp, "just_initialized": True, 
+                                        "timestamp":timestamp, "just_initialized": True,
                                         "end":False})
                         self.pipe.recv()
                 else:
@@ -122,8 +122,8 @@ class Tracker:
                             # run online global BA every {self.ba_freq} keyframes (here, we set as 20 keyframes)
                             self.printer.print(f"Online BA at {curr_kf_idx}th keyframe, frame index: {timestamp}",FontColor.TRACKER)
                             if not self.finish_first_online_ba:
-                                self.online_ba.dense_ba(2, 
-                                        enable_update_uncer=self.frontend.enable_opt_dyn_mask, 
+                                self.online_ba.dense_ba(2,
+                                        enable_update_uncer=self.frontend.enable_opt_dyn_mask,
                                         enable_udba=self.frontend.enable_opt_dyn_mask)
                                 self.finish_first_online_ba = True
                             else:
@@ -132,7 +132,7 @@ class Tracker:
                     # inform the mapper that the estimation of current pose and depth is finished
                     if self.cfg['mapping']['enable']:
                         self.pipe.send({"is_keyframe":True, "video_idx":curr_kf_idx,
-                                        "timestamp":timestamp, "just_initialized": False, 
+                                        "timestamp":timestamp, "just_initialized": False,
                                         "end":False})
                         self.pipe.recv()
 
@@ -140,7 +140,6 @@ class Tracker:
             self.printer.update_pbar()
 
         self.pipe.send({"is_keyframe":True, "video_idx":None,
-                        "timestamp":None, "just_initialized": False, 
+                        "timestamp":None, "just_initialized": False,
                         "end":True})
 
-                

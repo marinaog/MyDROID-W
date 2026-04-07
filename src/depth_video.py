@@ -22,7 +22,7 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 class DepthVideo:
-    ''' store the estimated poses and depth maps, 
+    ''' store the estimated poses and depth maps,
         shared between tracker and mapper '''
     def __init__(self, cfg, printer):
         self.cfg =cfg
@@ -49,8 +49,8 @@ class DepthVideo:
         self.images = torch.zeros(buffer, 3, ht, wd, device='cpu', dtype=torch.float32)
 
         # whether the valid_depth_mask is calculated/updated, if dirty, not updated, otherwise, updated
-        self.dirty = torch.zeros(buffer, device=self.device, dtype=torch.bool).share_memory_() 
-        # whether the corresponding part of pointcloud is deformed w.r.t. the poses and depths 
+        self.dirty = torch.zeros(buffer, device=self.device, dtype=torch.bool).share_memory_()
+        # whether the corresponding part of pointcloud is deformed w.r.t. the poses and depths
         self.npc_dirty = torch.zeros(buffer, device=self.device, dtype=torch.bool).share_memory_()
 
         self.poses = torch.zeros(buffer, 7, device=self.device, dtype=torch.float).share_memory_()  # world to camera
@@ -63,7 +63,7 @@ class DepthVideo:
         self.depth_scale = torch.zeros(buffer,device=self.device, dtype=torch.float).share_memory_()
         self.depth_shift = torch.zeros(buffer,device=self.device, dtype=torch.float).share_memory_()
         self.valid_depth_mask = torch.zeros(buffer, ht, wd, device=self.device, dtype=torch.bool).share_memory_()
-        self.valid_depth_mask_small = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.bool).share_memory_()        
+        self.valid_depth_mask_small = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.bool).share_memory_()
         ### feature attributes ###
         self.fmaps = torch.zeros(buffer, 1, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
         self.nets = torch.zeros(buffer, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
@@ -85,7 +85,7 @@ class DepthVideo:
                 self.feature_downsample_factor = 16
             else:
                 self.feature_downsample_factor = 14
-            
+
             # The followings are in cpu to save memory
             self.dino_feats = torch.zeros(buffer, ht//self.feature_downsample_factor, wd//self.feature_downsample_factor, n_features, device='cpu', dtype=torch.float).share_memory_()
             self.dino_feats_resize = torch.zeros(buffer, n_features, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
@@ -110,7 +110,7 @@ class DepthVideo:
     def __item_setter(self, index, item):
         if isinstance(index, int) and index >= self.counter.value:
             self.counter.value = index + 1
-        
+
         elif isinstance(index, torch.Tensor) and index.max().item() > self.counter.value:
             self.counter.value = index.max().item() + 1
 
@@ -147,7 +147,7 @@ class DepthVideo:
 
             if len(item[9].shape) == 3:
                 self.dino_feats_resize[index] = F.interpolate(item[9].permute(2,0,1).unsqueeze(0),
-                                                            self.disps_up.shape[-2:], 
+                                                            self.disps_up.shape[-2:],
                                                             mode='bilinear').squeeze()[:,self.slice_h,self.slice_w]
                 # y_cdot = w * x + b
                 # y = log(1 + exp(y_cdot))
@@ -157,7 +157,7 @@ class DepthVideo:
                     self.uncertainties[index] = torch.log(1.1 + torch.exp(y_cdot))
             else:
                 self.dino_feats_resize[index] = F.interpolate(item[9].permute(0,3,1,2),
-                                                            self.disps_up.shape[-2:], 
+                                                            self.disps_up.shape[-2:],
                                                             mode='bilinear')[:,:,self.slice_h,self.slice_w]
                 # y_cdot = w * x + b
                 # y = log(1 + exp(y_cdot))
@@ -165,7 +165,7 @@ class DepthVideo:
                     y_cdot = self.dino_feats_resize[index].permute(0, 2, 3, 1) @ self.affine_weights[:-1] + self.affine_weights[-1]
                     self.temp_y_cdot[index] = y_cdot
                     self.uncertainties[index] = torch.log(1.1 + torch.exp(y_cdot))
-                    
+
             # constrain the uncertainty of similar dino feats to be similar (TODO:unused in current implementation)
             # Compute pairwise similarity between all pixels within each frame
             # normalize the dino feats
@@ -229,7 +229,7 @@ class DepthVideo:
 
     def upsample_weight(self, weight):
         """ upsample weight to the original image size """
-        weight_up = F.interpolate(weight.unsqueeze(0), 
+        weight_up = F.interpolate(weight.unsqueeze(0),
                                 size=(self.ht, self.wd), mode='bilinear').squeeze()
         return weight_up
 
@@ -261,7 +261,7 @@ class DepthVideo:
             return_matrix = True
             N = self.counter.value
             ii, jj = torch.meshgrid(torch.arange(N), torch.arange(N),indexing="ij")
-        
+
         ii, jj = DepthVideo.format_indicies(ii, jj)
 
         if bidirectional:
@@ -284,22 +284,22 @@ class DepthVideo:
             return d.reshape(N, N)
 
         return d
-    
+
     def project_images_with_mask(self, images, pixel_positions, masks=None):
-        """ 
+        """
             Project images/depths from the input pixel positions using bilinear interpolation.
             This function will automatically return the mask where the given pixel positions are out of the images
         Args:
             images (torch.Tensor): A tensor of shape [B, C, H, W] representing the images/depths.
-            pixel_positions (torch.Tensor): A tensor of shape [B, H, W, 2] containing float 
+            pixel_positions (torch.Tensor): A tensor of shape [B, H, W, 2] containing float
                                             pixel positions for interpolation. Note that [:,:,:,0]
                                             is width and [:,:,:,1] is height.
-            masks (torch.Tensor, optional): A boolean tensor of shape [B, H, W]. If provided, 
-                                            specifies valid pixels. Default is None, which 
+            masks (torch.Tensor, optional): A boolean tensor of shape [B, H, W]. If provided,
+                                            specifies valid pixels. Default is None, which
                                             results in all pixels being valid at the begining.
-        
+
         Returns:
-            torch.Tensor: A tensor of shape [B, C, H, W] containing the projected images/depths, 
+            torch.Tensor: A tensor of shape [B, C, H, W] containing the projected images/depths,
                         where invalid pixels are set to 0.
             torch.Tensor: The combined mask that filters out invalid positions and applies
                       the original mask.
@@ -310,7 +310,7 @@ class DepthVideo:
         # If masks are not provided, create a mask of all ones (True) with the same shape as the images
         if masks is None:
             masks = torch.ones(B, H, W, dtype=torch.bool, device=device)
-        
+
         # Normalize pixel positions to range [-1, 1]
         grid = pixel_positions.clone()
         grid[..., 0] = 2.0 * (grid[..., 0] / (W - 1)) - 1.0
@@ -326,12 +326,12 @@ class DepthVideo:
         # Apply the combined mask: set to 0 where combined mask is False
         projected_image = projected_image.permute(0, 2, 3, 1)  # conver to [B, H, W, C]
         projected_image = projected_image * valid_mask.unsqueeze(-1)
-        
+
         return projected_image.permute(0, 3, 1, 2), valid_mask  # Return to [B, C, H, W]
 
     def ba(self, target, weight, eta, ii, jj, t0=1, t1=None, iters=2, lm=1e-4, ep=0.1, gamma=0.02, tao=0.1, lr=1e-2, weight_decay=2e-4,
            motion_only=False, enable_update_uncer=False, enable_udba=False, visualization_stage=False):      # ii, jj represent all img pairs
-        
+
         with self.get_lock():
             # [t0, t1] window of bundle adjustment optimization
             if t1 is None:
@@ -346,40 +346,40 @@ class DepthVideo:
                 assert not torch.isinf(self.affine_weights).any(), "self.affine_weights has inf value"
             if not self.metric_depth_reg:
                 droid_backends.ba(self.poses, self.disps, self.intrinsics[0], self.zeros,           # the shape of poses is determined by buffer size
-                    target, weight, self.uncertainties, 
+                    target, weight, self.uncertainties,
                     self.temp_y_cdot,
                     self.dino_feats_resize,
                     self.affine_weights,
-                    eta, ii, jj, t0, t1, iters, lm, ep, 
-                    self.cfg['tracking']['uncertainty_params']['gamma_data'], 
-                    self.cfg['tracking']['uncertainty_params']['gamma_prior'], 
+                    eta, ii, jj, t0, t1, iters, lm, ep,
+                    self.cfg['tracking']['uncertainty_params']['gamma_data'],
+                    self.cfg['tracking']['uncertainty_params']['gamma_prior'],
                     self.cfg['tracking']['uncertainty_params']['gamma_depth'],
                     lr, weight_decay,
                     motion_only, False, enable_update_uncer,
                     enable_udba, self.enable_affine_transform,
                     self.enable_bidirectional_uncer,
-                    self.debug)         # poses: [buffer, 7], disps: [buffer, h, w], 
+                    self.debug)         # poses: [buffer, 7], disps: [buffer, h, w],
             else:
                 droid_backends.ba(self.poses, self.disps, self.intrinsics[0], self.mono_disps,
-                    target, weight, self.uncertainties, 
+                    target, weight, self.uncertainties,
                     self.temp_y_cdot,
                     self.dino_feats_resize,
                     self.affine_weights,
-                    eta, ii, jj, t0, t1, iters, lm, ep, 
-                    self.cfg['tracking']['uncertainty_params']['gamma_data'], 
-                    self.cfg['tracking']['uncertainty_params']['gamma_prior'], 
+                    eta, ii, jj, t0, t1, iters, lm, ep,
+                    self.cfg['tracking']['uncertainty_params']['gamma_data'],
+                    self.cfg['tracking']['uncertainty_params']['gamma_prior'],
                     self.cfg['tracking']['uncertainty_params']['gamma_depth'],
                     lr, weight_decay,
                     motion_only, False, enable_update_uncer,
                     enable_udba, self.enable_affine_transform,
                     self.enable_bidirectional_uncer,
                     self.debug)          # t0, t1: window of keyframes for BA
-            
+
             self.disps.clamp_(min=1e-5)
 
     @torch.no_grad()
     def visualize_uncertainty(self, target, weight, ii, jj, frame_choice="nearest", mode="Before"):
-        """ 
+        """
         visualize the uncertainty before and after optimization, reprojection error, and the weight prediction
         """
         # for ind, i, j in zip(range(ii.shape[0]), ii, jj):
@@ -607,7 +607,7 @@ class DepthVideo:
 
     @torch.no_grad()
     def visualize_all_opt_params(self, out_directory=None, iteration="final"):
-        """ 
+        """
         visualize the uncertainty before and after optimization, disparity map
         """
         plot_dir = os.path.join(out_directory, "plots_" + iteration)
@@ -701,7 +701,7 @@ class DepthVideo:
             uncer_dir = os.path.join(plot_dir, "scaled_uncertainty")
             uncer_contour_dir = os.path.join(plot_dir, "uncertainty_contours")
             high_res_uncer_dir = os.path.join(plot_dir, "high_res_uncertainty")
-            
+
             os.makedirs(input_dir, exist_ok=True)
             os.makedirs(uncer_dir, exist_ok=True)
             os.makedirs(uncer_contour_dir, exist_ok=True)
@@ -709,14 +709,14 @@ class DepthVideo:
 
             def color_map(tensor, cmap='jet', vmin=0, vmax=1):
                 return (plt.get_cmap(cmap)(tensor.cpu().numpy() / vmax)[:, :, :3] * 255.0).astype(np.uint8)
-            
+
             # Save input image
             Image.fromarray((img_i * 255.0).astype(np.uint8)).save(f"{input_dir}/input_kf_{idx:03d}_ts_{int(self.timestamp[idx]):05d}.png")
 
             # Save scaled uncertainty
             uncer_rescaled_colored = color_map(uncer_rescaled, vmax=10.0)
             Image.fromarray(uncer_rescaled_colored).save(f"{uncer_dir}/uncertainty_kf_{idx:03d}_ts_{int(self.timestamp[idx]):05d}.png")
-            
+
             # Save uncertainty with contours
             fig_contour, ax_contour = plt.subplots(1, 1, figsize=(fig_width, fig_height))
             ax_contour.imshow(uncer_pred.cpu().numpy(), cmap='jet', vmin=0.0, vmax=1.0)
@@ -726,11 +726,11 @@ class DepthVideo:
             ax_contour.set_position([0, 0, 1, 1])  # Remove margins
             fig_contour.savefig(f"{uncer_contour_dir}/uncertainty_contour_kf_{idx:03d}_ts_{int(self.timestamp[idx]):05d}.png", dpi=100, bbox_inches='tight', pad_inches=0)
             plt.close(fig_contour)
-            
+
             # Save high-resolution scaled uncertainty
             uncer_rescaled_high_res_colored = color_map(uncer_rescaled_high_res, vmax=10.0)
             Image.fromarray(uncer_rescaled_high_res_colored).save(f"{high_res_uncer_dir}/high_res_uncertainty_kf_{idx:03d}_ts_{int(self.timestamp[idx]):05d}.png")
-            
+
         # Create gif
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', online=True)
 
@@ -764,11 +764,11 @@ class DepthVideo:
                 depth_mask = self.valid_depth_mask[index].clone().to(device)
                 c2w = self.get_pose(index,device)
         return est_depth, depth_mask, c2w
-    
+
     @torch.no_grad()
     def update_valid_depth_mask(self,up=True):
         '''
-        For each pixel, check whether the estimated depth value is valid or not 
+        For each pixel, check whether the estimated depth value is valid or not
         by the two-view consistency check, see eq.4 ~ eq.7 in the paper for details
 
         up (bool): if True, check on the orignial-scale depth map
@@ -787,20 +787,20 @@ class DepthVideo:
         common_intrinsic_id = 0  # we assume the intrinsics are the same within one scene
         intrinsic = self.intrinsics[common_intrinsic_id].detach() * (self.down_scale if up else 1.0)
         depths = 1.0/disps
-        thresh = self.cfg['tracking']['multiview_filter']['thresh'] * depths.mean(dim=[1,2]) 
+        thresh = self.cfg['tracking']['multiview_filter']['thresh'] * depths.mean(dim=[1,2])
         count = droid_backends.depth_filter(
             self.poses, self.disps_up if up else self.disps, intrinsic, dirty_index, thresh)
         filter_visible_num = self.cfg['tracking']['multiview_filter']['visible_num']
-        multiview_masks = (count >= filter_visible_num) 
+        multiview_masks = (count >= filter_visible_num)
         depths[~multiview_masks]=torch.nan
         depths_reshape = depths.view(depths.shape[0],-1)
         depths_median = depths_reshape.nanmedian(dim=1).values
         masks = depths < 3*depths_median[:,None,None]
         if up:
-            self.valid_depth_mask[dirty_index] = masks 
+            self.valid_depth_mask[dirty_index] = masks
             self.dirty[dirty_index] = False
         else:
-            self.valid_depth_mask_small[dirty_index] = masks 
+            self.valid_depth_mask_small[dirty_index] = masks
 
     def set_dirty(self,index_start, index_end):
         self.dirty[index_start:index_end] = True
@@ -841,7 +841,7 @@ class DepthVideo:
             poses.append(pose)
             timestamps.append(timestamp)
         poses = torch.stack(poses,dim=0).numpy()
-        timestamps = torch.stack(timestamps,dim=0).numpy()   
+        timestamps = torch.stack(timestamps,dim=0).numpy()
         np.savez(path,poses=poses, timestamps=timestamps)
         self.printer.print(f"Saved poses and timestamp: {path}", FontColor.INFO)
 

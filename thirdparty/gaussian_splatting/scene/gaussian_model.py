@@ -24,16 +24,23 @@ from thirdparty.gaussian_splatting.utils.general_utils import (
     build_scaling_rotation,
     get_expon_lr_func,
     helper,
+    get_cosine_lr,
     inverse_sigmoid,
     strip_symmetric,
 )
 from thirdparty.gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2
 from thirdparty.gaussian_splatting.utils.sh_utils import RGB2SH
 from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
+from thirdparty.gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 
+from copy import deepcopy
+from src.utils.registry import ARCH_REGISTRY
+from src.utils import color_mlp_arch
+from src.utils.camera_utils import Camera
+@ARCH_REGISTRY.register()
 
 class GaussianModel:
-    def __init__(self, sh_degree: int, config=None):
+    def __init__(self, sh_degree: int, config=None, dataset=None, raw=False, use_mlp=False):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
 
@@ -62,9 +69,21 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
         self.config = config
+        self.dataset = dataset
         self.ply_input = None
 
         self.isotropic = False
+        self.raw = raw
+        self.use_mlp = use_mlp
+
+        # Init of MLP stuff
+        if use_mlp:
+            color_mlp_opt = config["mlp_opt_params"]["color_mlp_opt"]
+            network_type = color_mlp_opt.pop('type')
+            color_mlp_opt = deepcopy(color_mlp_opt)
+            net = ARCH_REGISTRY.get(network_type)(**color_mlp_opt)
+            self.color_mlp = net
+            self.color_mlp.to('cuda')
 
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
@@ -93,6 +112,14 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
+    def get_features_mlp(self):
+        # Tuple index 0: Bias (3D) -> self._features_dc
+        # Tuple index 1: Feature (16D) -> self._features_rest
+        features_dc = self._features_dc[:, 0, :]
+        features_rest = self._features_rest[:, 0, :]
+        return features_dc, features_rest
+
+    @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
 
@@ -110,7 +137,15 @@ class GaussianModel:
 
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
-        rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        if self.raw:
+            # For color bias initialization:
+            self.temp_raw_float_image = image_ab.detach().permute(1, 2, 0).contiguous().cpu().numpy()
+            # For gaussians seed:
+            image_ab = torch.clamp(image_ab * 255, 0, 255)
+        else:
+            image_ab *= 255
+
+        rgb_raw = image_ab.byte().permute(1, 2, 0).contiguous().cpu().numpy()
 
         if depthmap is not None:
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
@@ -144,8 +179,8 @@ class GaussianModel:
         if "adaptive_pointsize" in self.config["mapping"]:
             if self.config["mapping"]["adaptive_pointsize"]:
                 # The point size can at max be 0.05. I wonder if this can
-                # cause problems in the RGB-only case since 0.05 does not 
-                # really mean much then. Well as long as we initialize to 
+                # cause problems in the RGB-only case since 0.05 does not
+                # really mean much then. Well as long as we initialize to
                 # reasonable scale it should be ok.
                 point_size = min(0.05, point_size * np.median(depth))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -170,14 +205,17 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
-        points = np.asarray(pcd_tmp.points)
-        colors = np.asarray(pcd_tmp.colors)
-
-        # Downsample the Gaussian means randomly by downsample_factor = 64
-        # So only 1.5 % of all pixels in the image are used for anchoring
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
-        new_rgb = np.asarray(pcd_tmp.colors)
+        if self.raw:
+            pts_view = (W2C[:3, :3] @ new_xyz.T + W2C[:3, 3:4]).T
+            u = np.round((pts_view[:, 0] * cam.fx / pts_view[:, 2]) + cam.cx).astype(int)
+            v = np.round((pts_view[:, 1] * cam.fy / pts_view[:, 2]) + cam.cy).astype(int)
+            u = np.clip(u, 0, cam.image_width - 1)
+            v = np.clip(v, 0, cam.image_height - 1)
+            new_rgb = self.temp_raw_float_image[v, u]
+        else:
+            new_rgb = np.asarray(pcd_tmp.colors)
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
@@ -185,10 +223,11 @@ class GaussianModel:
         self.ply_input = pcd
 
         fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())
-        # The features are the SH coefficients. We initialize them with the
-        # first coefficient which decodes into the RGB colors according to 
-        # the sh_utils i.e. we store for the first component of the SH as init 
+        colors_raw = torch.from_numpy(np.asarray(pcd.colors)).float().cuda()
+        if self.use_mlp:
+            fused_color = torch.log(colors_raw + 1e-6)
+        else:
+            fused_color = RGB2SH(colors_raw)
         features = (
             torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
             .float()
@@ -236,13 +275,20 @@ class GaussianModel:
         new_features_dc = nn.Parameter(
             features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
         )
-        new_features_rest = nn.Parameter(
-            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
-        )
+
+        if self.use_mlp:
+            color_feat_length = self.config['mlp_opt_params']['color_feat_opt']['feat_len']
+            color_feat_sigma = self.config['mlp_opt_params']['color_feat_opt']['feat_init_sigma']
+            new_features_rest = nn.Parameter(
+            torch.randn((features.shape[0], 1, color_feat_length)) * color_feat_sigma, requires_grad=True)
+        else:
+            new_features_rest = nn.Parameter(
+                features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+            )
         new_scaling = nn.Parameter(scales.requires_grad_(True))
         new_rotation = nn.Parameter(rots.requires_grad_(True))
         new_opacity = nn.Parameter(opacities.requires_grad_(True))
-        
+
         # Each Gaussian is assigned the kf id that anchored it. This is great,
         # since I need this for the deformation.
         new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id
@@ -280,16 +326,6 @@ class GaussianModel:
                 "name": "xyz",
             },
             {
-                "params": [self._features_dc],
-                "lr": training_args.feature_lr,
-                "name": "f_dc",
-            },
-            {
-                "params": [self._features_rest],
-                "lr": training_args.feature_lr / 20.0,
-                "name": "f_rest",
-            },
-            {
                 "params": [self._opacity],
                 "lr": training_args.opacity_lr,
                 "name": "opacity",
@@ -305,6 +341,38 @@ class GaussianModel:
                 "name": "rotation",
             },
         ]
+
+        if self.use_mlp:
+            # 0. Store initial values for the scheduler
+            mlp_lr = float(self.config["mlp_opt_params"]["optim_color_mlp"]["lr"])
+            feat_lr = float(self.config["mlp_opt_params"]["feature_lr_mlp_feat"])
+            bias_lr = float(self.config["mlp_opt_params"]["feature_lr_mlp_bias"])
+
+            # 1. The Global MLP weights (F_theta)
+            l.append({
+                "params": list(self.color_mlp.parameters()),
+                "lr": mlp_lr,
+                "lr_init": mlp_lr, # Stored for scheduler
+                "name": "color_mlp"
+            })
+            # 2. Per-Gaussian Color Biases (b_i)
+            l.append({
+                "params": [self._features_dc], #_color_features
+                "lr": bias_lr,
+                "lr_init": bias_lr, # Stored for scheduler
+                "name": "f_dc"
+            })
+            # 3. Per-Gaussian Color Features (f_i)
+            l.append({
+                "params": [self._features_rest], #_color_biases
+                "lr": feat_lr,
+                "lr_init": feat_lr, # Stored for scheduler
+                "name": "f_rest"
+            })
+        else:
+            # Standard SH features if not using MLP
+            l.append({"params": [self._features_dc], "lr": training_args.feature_lr, "name": "f_dc"})
+            l.append({"params": [self._features_rest], "lr": training_args.feature_lr / 20.0, "name": "f_rest"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
@@ -322,8 +390,9 @@ class GaussianModel:
     def update_learning_rate(self, iteration):
         """Learning rate scheduling per step"""
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                # lr = self.xyz_scheduler_args(iteration)
+            name = param_group["name"]
+
+            if name == "xyz":
                 lr = helper(
                     iteration,
                     lr_init=self.lr_init,
@@ -331,9 +400,16 @@ class GaussianModel:
                     lr_delay_mult=self.lr_delay_mult,
                     max_steps=self.max_steps,
                 )
-
                 param_group["lr"] = lr
-                return lr
+
+            elif name in ["color_mlp", "f_dc", "f_rest"] and self.use_mlp:
+                # Ensure these were stored in self during training_setup
+                # LE3D uses 1e-4 for MLP/Bias and 2e-3 for Features
+                lr_init = param_group.get("lr_init", param_group["lr"])
+                lr_final = 1.0e-5
+
+                lr = get_cosine_lr(iteration, lr_init, lr_final, self.max_steps)
+                param_group["lr"] = lr
 
     def construct_list_of_attributes(self):
         l = ["x", "y", "z", "nx", "ny", "nz"]
@@ -401,6 +477,15 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
+    def load_mlp_weights(self, model_path):
+        mlp_path = os.path.join(model_path, "color_mlp.pth")
+        if os.path.exists(mlp_path):
+            checkpoint = torch.load(mlp_path)
+            self.color_mlp.load_state_dict(checkpoint)
+            self.color_mlp.cuda()
+            self.color_mlp.eval()
+            print(f"  > Loaded MLP weights from {mlp_path}")
+
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
@@ -413,80 +498,60 @@ class GaussianModel:
             return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
         self.ply_input = fetchPly_nocolor(path)
-        xyz = np.stack(
-            (
-                np.asarray(plydata.elements[0]["x"]),
-                np.asarray(plydata.elements[0]["y"]),
-                np.asarray(plydata.elements[0]["z"]),
-            ),
-            axis=1,
-        )
+
+        # 1. Load Geometry
+        xyz = np.stack((
+            np.asarray(plydata.elements[0]["x"]),
+            np.asarray(plydata.elements[0]["y"]),
+            np.asarray(plydata.elements[0]["z"]),
+        ), axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
+        # 2. Load DC Features (Bias for MLP or Base Color for SH)
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        extra_f_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("f_rest_")
-        ]
+        # 3. Load Rest Features (Extra latents for MLP or SH coefficients)
+        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-        assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
+
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_extra = features_extra.reshape(
-            (features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
-        )
 
-        scale_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("scale_")
-        ]
-        scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
+        # UNIVERSAL RESHAPE LOGIC
+        num_points = features_extra.shape[0]
+        total_extra_feats = features_extra.shape[1]
+
+        if self.use_mlp or (total_extra_feats % 3 != 0):
+            # If MLP or if the features don't divide by 3 (RGB),
+            # treat as a single feature block (N, 1, Feat_Dim)
+            features_extra = features_extra.reshape((num_points, 1, total_extra_feats))
+        else:
+            # Standard SH: divide features into 3 color channels
+            coeffs_per_channel = total_extra_feats // 3
+            features_extra = features_extra.reshape((num_points, 3, coeffs_per_channel))
+        # 4. Load Scale/Rotation
+        scale_names = sorted([p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")], key=lambda x: int(x.split("_")[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        rot_names = [
-            p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
-        ]
-        rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
+        rot_names = sorted([p.name for p in plydata.elements[0].properties if p.name.startswith("rot")], key=lambda x: int(x.split("_")[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(
-            torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
-        self._features_dc = nn.Parameter(
-            torch.tensor(features_dc, dtype=torch.float, device="cuda")
-            .transpose(1, 2)
-            .contiguous()
-            .requires_grad_(True)
-        )
-        self._features_rest = nn.Parameter(
-            torch.tensor(features_extra, dtype=torch.float, device="cuda")
-            .transpose(1, 2)
-            .contiguous()
-            .requires_grad_(True)
-        )
-        self._opacity = nn.Parameter(
-            torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(
-                True
-            )
-        )
-        self._scaling = nn.Parameter(
-            torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
-        self._rotation = nn.Parameter(
-            torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
+        # 5. Initialize Tensors
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
         self.active_sh_degree = self.max_sh_degree
         self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
         self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
@@ -496,36 +561,40 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == name:
-                stored_state = self.optimizer.state.get(group["params"][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                old_param = group["params"][0]
+                stored_state = self.optimizer.state.get(old_param, None)
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group["params"][0]] = stored_state
+                if old_param in self.optimizer.state:
+                    del self.optimizer.state[old_param]
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                new_param = nn.Parameter(tensor.requires_grad_(True))
+                group["params"][0] = new_param
+
+                if stored_state is not None:
+                    # If 'step' is missing in the old state for some reason, add it
+                    if "step" not in stored_state:
+                        stored_state["step"] = torch.tensor(0.0, device="cuda")
+                    self.optimizer.state[new_param] = stored_state
+                else:
+                    # Initialize full Adam state for brand new Gaussians
+                    # 'step' must be a float tensor for many Adam implementations
+                    self.optimizer.state[new_param] = {
+                        "exp_avg": torch.zeros_like(tensor),
+                        "exp_avg_sq": torch.zeros_like(tensor),
+                        "step": torch.tensor(0.0, device="cuda")
+                    }
+
+                optimizable_tensors[group["name"]] = new_param
         return optimizable_tensors
-
-    def replace_tensor_to_optimizer_rot(self, tensor, name):
-        optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            if group["name"] == name:
-                stored_state = self.optimizer.state.get(group["params"][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                # self.optimizer.state[group["params"][0]] = stored_state
-
-                # optimizable_tensors[group["name"]] = group["params"][0]
-        return optimizable_tensors
-
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            # Skip pruning for global MLP weights because their shape doesn't match the number of Gaussians.
+            if group["name"] == "color_mlp":
+                optimizable_tensors[group["name"]] = group["params"][0]
+                continue
+
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -566,6 +635,9 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if group["name"] == "color_mlp":
+                optimizable_tensors[group["name"]] = group["params"][0]
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group["params"][0], None)
@@ -612,36 +684,39 @@ class GaussianModel:
     ):
         d = {
             "xyz": new_xyz,
-            "f_dc": new_features_dc,
-            "f_rest": new_features_rest,
             "opacity": new_opacities,
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
-
-        # The cat_tensors_to_optimizer updates the self.optimizer interal
-        # variables accounting for the new Gaussians and also concatenates
-        # the actual optimizable parameters, but does not update the global
-        # attributes.
+        d["f_dc"] = new_features_dc
+        d["f_rest"] = new_features_rest
+        for key in d:
+            d[key] = d[key].cuda()
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
-        # Update the global attributes
+
         self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
-        # self.n_obs describes how many times the Gaussian has been observed
-        # which I suppose is related to from how many frames it is denoted
-        # visible
         if new_n_obs is not None:
             self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
+
+        if self.config["dataset"] != "realsense" and self.use_mlp:  # So mlp being use and no inference
+            with torch.no_grad():
+                with torch.no_grad():
+                    res_dict = self.replace_tensor_to_optimizer(self._features_dc, "f_dc")
+                    self._features_dc = res_dict["f_dc"]
+                    res_dict_rest = self.replace_tensor_to_optimizer(self._features_rest, "f_rest")
+                    self._features_rest = res_dict_rest["f_rest"]
+
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -747,3 +822,17 @@ class GaussianModel:
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )
         self.denom[update_filter] += 1
+
+    # MLP stuff
+    def get_mlp_color(self, viewpoint_camera):
+        # 1. Get Gaussian features (f_i)
+        f_i = self.get_features_mlp
+
+        # 2. Get Viewing Direction/Pose (v)
+        dir_pp = (self.get_xyz - viewpoint_camera.camera_center.repeat(self.get_xyz.shape[0], 1))
+        v = dir_pp / dir_pp.norm(dim=1, keepdim=True) # Normalized viewing direction (d)
+
+        # 3. MLP Forward Pass
+        colors_precomp = self.color_mlp(f_i, v)
+
+        return colors_precomp

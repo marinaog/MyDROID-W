@@ -8,11 +8,11 @@ from src.utils.datasets import load_metric_depth, load_img_feature
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
 
 class MotionFilter:
-    """ This class is used to filter incoming frames and extract features 
+    """ This class is used to filter incoming frames and extract features
         mainly inherited from DROID-SLAM
     """
 
-    def __init__(self, net, video, cfg, thresh=2.5, device="cuda:0"):
+    def __init__(self, net, video, cfg, thresh=2.5, device="cuda:0", output = None):
         self.cfg = cfg
         # split net modules
         self.cnet = net.cnet
@@ -24,13 +24,14 @@ class MotionFilter:
         self.device = device
 
         self.count = 0
+        self.output = output
 
         # mean, std for image normalization
         self.MEAN = torch.as_tensor([0.485, 0.456, 0.406], device=self.device)[:, None, None]
         self.STDV = torch.as_tensor([0.229, 0.224, 0.225], device=self.device)[:, None, None]
-        
+
         self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
-        self.save_dir = cfg['data']['output'] + '/' + cfg['scene']
+        self.save_dir = output
         self.metric_depth_estimator = get_metric_depth_estimator(cfg)
         if cfg['mapping']["uncertainty_params"]['activate']:
             # If mapping needs dino features, we still need feature extractor
@@ -69,7 +70,7 @@ class MotionFilter:
         if self.video.counter.value == 0:
             net, inp = self.__context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
-            mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]))
+            mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]), save_path=self.output)
             if self.uncertainty_aware:
                 dino_features = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=self.cfg['mono_prior']['save_feature'])
             else:
@@ -79,7 +80,7 @@ class MotionFilter:
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
             self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
         ### only add new frame if there is enough motion ###
-        else:                
+        else:
             # index correlation volume
             coords0 = pops.coords_grid(ht, wd, device=self.device)[None,None]
             corr = CorrBlock(self.fmap[None,[0]], gmap[None,[0]])(coords0)
@@ -98,7 +99,7 @@ class MotionFilter:
                 self.count = 0
                 net, inp = self.__context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
-                mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]))
+                mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]), save_path=self.output)
                 if self.uncertainty_aware:
                     dino_features = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=self.cfg['mono_prior']['save_feature'])
                 else:

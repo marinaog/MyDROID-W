@@ -1,4 +1,7 @@
 import os
+import json
+import ast
+from datetime import datetime
 import torch
 import numpy as np
 import time
@@ -30,7 +33,21 @@ class SLAM:
         self.device = cfg["device"]
         self.verbose: bool = cfg["verbose"]
         self.logger = None
-        save_dir_base = cfg["data"]["output"] + "/" + cfg["scene"]
+        self.raw = cfg.get("raw", False)
+        self.use_mlp = cfg.get("use_mlp", False)
+        #if isinstance(raw_cfg, str):
+        #    raw_cfg = raw_cfg.strip().lower() in ("1", "true", "yes", "y", "on")
+        #self.raw = bool(raw_cfg)
+
+        save_dir_base = os.path.join(cfg["data"]["output"], cfg["scene"])
+        if self.raw:
+            if self.use_mlp:
+                save_dir_base = os.path.join(save_dir_base, "raw_mlp")
+            else:
+                save_dir_base = os.path.join(save_dir_base, "raw")
+
+        else:
+            save_dir_base = os.path.join(save_dir_base, "srgb")
 
         save_dir = save_dir_base
         version = 2
@@ -121,7 +138,7 @@ class SLAM:
             self.terminate()
 
     def mapping(self, pipe, q_main2vis, q_vis2main):
-        self.mapper = Mapper(self, pipe, q_main2vis, q_vis2main)
+        self.mapper = Mapper(self, pipe, q_main2vis, q_vis2main, self.save_dir)
         self.printer.print("Mapping Triggered!", FontColor.MAPPER)
 
         self.all_trigered += 1
@@ -222,6 +239,7 @@ class SLAM:
                 fast_mode=self.cfg['fast_mode'],
             )
             full_traj_eval(traj_est, self.stream, self.printer, self.logger, f"{self.save_dir}/traj", "full_traj")
+            self._save_final_metrics_txt()
 
             self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
 
@@ -240,6 +258,64 @@ class SLAM:
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
         timer._report_summary(self.save_dir)
         self.final_clean = True
+
+    def _save_final_metrics_txt(self):
+        traj_metrics_path = os.path.join(self.save_dir, "traj", "metrics_full_traj.txt")
+        render_metrics_path = os.path.join(
+            self.save_dir, "plots_after_refine", "render_metrics_summary.json"
+        )
+        out_path = os.path.join(self.save_dir, "final_metrics.txt")
+
+        if not os.path.exists(traj_metrics_path):
+            self.printer.print(
+                f"Skip final_metrics.txt: missing {traj_metrics_path}",
+                FontColor.WARNING,
+            )
+            return
+        if not os.path.exists(render_metrics_path):
+            self.printer.print(
+                f"Skip final_metrics.txt: missing {render_metrics_path}",
+                FontColor.WARNING,
+            )
+            return
+
+        with open(traj_metrics_path, "r") as f:
+            traj_text = f.read()
+
+        rmse = None
+        stats_marker = "statistics:"
+        marker_idx = traj_text.find(stats_marker)
+        if marker_idx != -1:
+            stats_text = traj_text[marker_idx + len(stats_marker) :].strip()
+            try:
+                stats_dict = ast.literal_eval(stats_text)
+                rmse = stats_dict.get("rmse", None)
+            except (SyntaxError, ValueError):
+                rmse = None
+
+        with open(render_metrics_path, "r") as f:
+            render_metrics = json.load(f)
+
+        psnr = render_metrics.get("mean_psnr", None)
+        ssim = render_metrics.get("mean_ssim", None)
+        lpips = render_metrics.get("mean_lpips", None)
+        depth_l1 = render_metrics.get("depth_l1", None)
+
+        header = "# ate rmse (m) | psnr | ssim | lpips | depth_l1 (m)"
+        row_values = [rmse, psnr, ssim, lpips, depth_l1]
+        row = " , ".join("null" if v is None else str(v) for v in row_values)
+
+        with open(out_path, "w") as f:
+            f.write(header + "\n")
+            f.write(row + "\n")
+
+        run_created_at_path = os.path.join(self.save_dir, "run_created_at.txt")
+        run_created_at_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        with open(run_created_at_path, "w") as f:
+            f.write(f"run_created_at: {run_created_at_str}\n")
+
+        self.printer.print(f"Saved final metrics to {out_path}", FontColor.EVAL)
+        self.printer.print(f"Saved run timestamp to {run_created_at_path}", FontColor.EVAL)
 
     def _eval_depth_all(self, ate_statistics, global_scale, r_a, t_a):
         """From Splat-SLAM. Not used in WildGS-SLAM evaluation, but might be useful in the future."""
@@ -315,7 +391,7 @@ class SLAM:
             background = torch.tensor(
                 bg_color, dtype=torch.float32, device=self.device
             )
-            gaussians = GaussianModel(self.cfg['mapping']['model_params']['sh_degree'], config=self.cfg)
+            gaussians = GaussianModel(self.cfg['mapping']['model_params']['sh_degree'], config=self.cfg, dataset=self.dataset, raw=self.raw, use_mlp=self.use_mlp)
 
             params_gui = gui_utils.ParamsGUI(
                 pipe=pipeline_params,
