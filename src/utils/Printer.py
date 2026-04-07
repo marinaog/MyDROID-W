@@ -38,7 +38,7 @@ def get_msg_prefix(color):
 class TrivialPrinter(object):
     def print(self,msg:str,color=None):
         msg_prefix = get_msg_prefix(color)
-        msg = msg_prefix + msg + Style.RESET_ALL
+        msg = msg_prefix + str(msg) + Style.RESET_ALL
         print(msg)        
 
 class Printer(TrivialPrinter):
@@ -50,7 +50,7 @@ class Printer(TrivialPrinter):
         process.start()
     def print(self,msg:str,color=None):
         msg_prefix = get_msg_prefix(color)
-        msg = msg_prefix + msg + Style.RESET_ALL
+        msg = msg_prefix + str(msg) + Style.RESET_ALL
         with self.msg_lock:
             self.msg_queue.put(msg)
     def update_pbar(self):

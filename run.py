@@ -49,11 +49,11 @@ if __name__ == '__main__':
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    config.save_config(cfg, f'{output_dir}/cfg.yaml')
 
     dataset = get_dataset(cfg)
 
     slam = SLAM(cfg,dataset)
+    config.save_config(cfg, f'{slam.save_dir}/cfg.yaml')
     slam.run()
 
     end_time = strftime("%Y-%m-%d %H:%M:%S", gmtime())

@@ -1,6 +1,7 @@
 import os
 import json
 import ast
+import uuid
 from datetime import datetime
 import torch
 import numpy as np
@@ -24,20 +25,33 @@ from src.gui import gui_utils, slam_gui
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
 from torch.utils.tensorboard import SummaryWriter
 from src.utils.sys_timer import timer
+from src.utils.wandb_logger import WandbLogger
 import ctypes
+
 
 class SLAM:
     def __init__(self, cfg, stream: BaseDataset):
         super(SLAM, self).__init__()
         self.cfg = cfg
+        self.cfg.setdefault("wandb", {})
+        self.cfg["wandb"].setdefault("enable", False)
+        self.cfg["wandb"].setdefault("offline", False)
+        self.cfg["wandb"].setdefault("project", "wildgs-slam")
+        self.cfg["wandb"].setdefault("entity", None)
+        self.cfg["wandb"].setdefault("group", None)
+        self.cfg["wandb"].setdefault("run_name", None)
+        self.cfg["wandb"].setdefault("track_ate_per_keyframe", True)
+        self.cfg["wandb"].setdefault("system_log_every_steps", 25)
+        self.cfg["wandb"].setdefault("tags", [])
+        if self.cfg["wandb"].get("run_id") is None:
+            self.cfg["wandb"]["run_id"] = uuid.uuid4().hex
+
         self.device = cfg["device"]
         self.verbose: bool = cfg["verbose"]
         self.logger = None
+        self.wandb_logger = None
         self.raw = cfg.get("raw", False)
         self.use_mlp = cfg.get("use_mlp", False)
-        #if isinstance(raw_cfg, str):
-        #    raw_cfg = raw_cfg.strip().lower() in ("1", "true", "yes", "y", "on")
-        #self.raw = bool(raw_cfg)
 
         save_dir_base = os.path.join(cfg["data"]["output"], cfg["scene"])
         if self.raw:
@@ -45,7 +59,6 @@ class SLAM:
                 save_dir_base = os.path.join(save_dir_base, "raw_mlp")
             else:
                 save_dir_base = os.path.join(save_dir_base, "raw")
-
         else:
             save_dir_base = os.path.join(save_dir_base, "srgb")
 
@@ -66,9 +79,7 @@ class SLAM:
 
         self.droid_net: DroidNet = DroidNet()
 
-        self.printer = Printer(
-            len(stream)
-        )  # use an additional process for printing all the info
+        self.printer = Printer(len(stream))
 
         self.load_pretrained(cfg)
         self.droid_net.to(self.device).eval()
@@ -82,7 +93,6 @@ class SLAM:
         self.video = DepthVideo(cfg, self.printer)
         self.ba = Backend(self.droid_net, self.video, self.cfg)
 
-        # post processor - fill in poses for non-keyframes
         self.traj_filler = PoseTrajectoryFiller(
             cfg=cfg,
             net=self.droid_net,
@@ -115,12 +125,13 @@ class SLAM:
         )
 
     def tracking(self, pipe):
-        # clean all event writer files
         for file in os.listdir(self.save_dir):
             if file.startswith("events.out.tfevents."):
                 os.remove(os.path.join(self.save_dir, file))
 
         event_writer = SummaryWriter(self.save_dir)
+        self.wandb_logger = WandbLogger(self.cfg, self.save_dir, component="tracking")
+        self.logger = self.wandb_logger
         self.tracker = Tracker(self, pipe, event_writer)
         self.printer.print("Tracking Triggered!", FontColor.TRACKER)
         self.all_trigered += 1
@@ -132,12 +143,20 @@ class SLAM:
             pass
         self.printer.pbar_ready()
         self.tracker.run(self.stream)
+        timer._report_summary(self.save_dir)
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_timer_stats(timer.get_function_stats())
+            self.wandb_logger.log_system_stats(force=True)
+            self.wandb_logger.finish()
+        event_writer.close()
         self.printer.print("Tracking Done!", FontColor.TRACKER)
 
         if not self.cfg["mapping"]["enable"]:
             self.terminate()
 
     def mapping(self, pipe, q_main2vis, q_vis2main):
+        self.wandb_logger = WandbLogger(self.cfg, self.save_dir, component="mapping")
+        self.logger = self.wandb_logger
         self.mapper = Mapper(self, pipe, q_main2vis, q_vis2main, self.save_dir)
         self.printer.print("Mapping Triggered!", FontColor.MAPPER)
 
@@ -151,6 +170,12 @@ class SLAM:
 
         if self.cfg["mapping"]["enable"]:
             self.terminate()
+
+        timer._report_summary(self.save_dir)
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_timer_stats(timer.get_function_stats())
+            self.wandb_logger.log_system_stats(force=True)
+            self.wandb_logger.finish()
 
     @timer.section("Final Global BA")
     def backend(self):
@@ -180,7 +205,7 @@ class SLAM:
             self.video.save_video(f"{self.save_dir}/video.npz")
             if not isinstance(self.stream, RGB_NoPose):
                 try:
-                    ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
+                    kf_traj_eval(
                         f"{self.save_dir}/video.npz",
                         f"{self.save_dir}/traj/before_final_ba",
                         "kf_traj",
@@ -207,7 +232,7 @@ class SLAM:
         self.video.save_video(f"{self.save_dir}/video.npz")
         if not isinstance(self.stream, RGB_NoPose):
             try:
-                ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
+                kf_traj_eval(
                     f"{self.save_dir}/video.npz",
                     f"{self.save_dir}/traj",
                     "kf_traj",
@@ -220,17 +245,13 @@ class SLAM:
 
         if self.cfg["mapping"]["enable"]:
             if self.cfg["tracking"]["backend"]["final_ba"]:
-                self.mapper.final_refine(
-                    iters=self.cfg["mapping"]["final_refine_iters"]
-                )  # this performs a set of optimizations with RGBD loss to correct
+                self.mapper.final_refine(iters=self.cfg["mapping"]["final_refine_iters"])
 
-            # Evaluate the metrics
             self.mapper.save_all_kf_figs(
                 self.save_dir,
                 iteration="after_refine",
             )
 
-            # Regenerate feature extractor for non-keyframes
             self.traj_filler.setup_feature_extractor()
             traj_est = full_traj_fill(
                 self.traj_filler,
@@ -238,13 +259,20 @@ class SLAM:
                 self.stream,
                 fast_mode=self.cfg['fast_mode'],
             )
-            full_traj_eval(traj_est, self.stream, self.printer, self.logger, f"{self.save_dir}/traj", "full_traj")
+            full_traj_eval(
+                traj_est,
+                self.stream,
+                self.printer,
+                self.logger,
+                f"{self.save_dir}/traj",
+                "full_traj",
+            )
             self._save_final_metrics_txt()
+            self._log_wandb_final_metrics()
 
             self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
 
         else:
-            traj_est = None
             with timer.section("Full Trajectory Filling"):
                 self.traj_filler.setup_feature_extractor()
                 traj_est = full_traj_fill(
@@ -253,11 +281,120 @@ class SLAM:
                     self.stream,
                     fast_mode=True,
                 )
-            full_traj_eval(traj_est, self.stream, self.printer, self.logger, f"{self.save_dir}/traj", "full_traj")
+            full_traj_eval(
+                traj_est,
+                self.stream,
+                self.printer,
+                self.logger,
+                f"{self.save_dir}/traj",
+                "full_traj",
+            )
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
         timer._report_summary(self.save_dir)
         self.final_clean = True
+
+    def _load_json_if_exists(self, path):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            self.printer.print(f"Failed to parse {path}: {e}", FontColor.WARNING)
+            return None
+
+    def _parse_traj_metrics_txt(self, path):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                text = f.read()
+        except Exception as e:
+            self.printer.print(f"Failed to read {path}: {e}", FontColor.WARNING)
+            return None
+
+        stats_marker = "statistics:"
+        marker_idx = text.find(stats_marker)
+        if marker_idx == -1:
+            return None
+
+        stats_text = text[marker_idx + len(stats_marker):].strip()
+        try:
+            return ast.literal_eval(stats_text)
+        except Exception as e:
+            self.printer.print(
+                f"Failed to parse trajectory stats from {path}: {e}",
+                FontColor.WARNING,
+            )
+            return None
+
+    def _log_wandb_final_metrics(self):
+        if self.wandb_logger is None:
+            return
+
+        before_render = self._load_json_if_exists(
+            os.path.join(self.save_dir, "plots_before_refine", "render_metrics_summary.json")
+        )
+        after_render = self._load_json_if_exists(
+            os.path.join(self.save_dir, "plots_after_refine", "render_metrics_summary.json")
+        )
+
+        before_kf_ate = self._parse_traj_metrics_txt(
+            os.path.join(self.save_dir, "traj", "before_final_ba", "metrics_kf_traj.txt")
+        )
+        after_kf_ate = self._parse_traj_metrics_txt(
+            os.path.join(self.save_dir, "traj", "metrics_kf_traj.txt")
+        )
+        full_traj_ate = self._parse_traj_metrics_txt(
+            os.path.join(self.save_dir, "traj", "metrics_full_traj.txt")
+        )
+
+        rows = []
+        for stage, render, kf_ate in [
+            ("before_refine", before_render, before_kf_ate),
+            ("after_refine", after_render, after_kf_ate),
+        ]:
+            rows.append(
+                [
+                    stage,
+                    (render or {}).get("mean_psnr"),
+                    (render or {}).get("mean_ssim"),
+                    (render or {}).get("mean_lpips"),
+                    (render or {}).get("depth_l1"),
+                    (render or {}).get("mean_psnr_raw"),
+                    (render or {}).get("mean_ssim_raw"),
+                    (kf_ate or {}).get("rmse"),
+                    (kf_ate or {}).get("mean"),
+                    (kf_ate or {}).get("median"),
+                ]
+            )
+
+        self.wandb_logger.log_table(
+            key="summary/before_after_refine_metrics",
+            columns=[
+                "stage",
+                "mean_psnr",
+                "mean_ssim",
+                "mean_lpips",
+                "depth_l1",
+                "mean_psnr_raw",
+                "mean_ssim_raw",
+                "kf_ate_rmse",
+                "kf_ate_mean",
+                "kf_ate_median",
+            ],
+            rows=rows,
+        )
+
+        if full_traj_ate is not None:
+            self.wandb_logger.log(
+                {
+                    "summary/full_traj_ate_rmse": full_traj_ate.get("rmse"),
+                    "summary/full_traj_ate_mean": full_traj_ate.get("mean"),
+                    "summary/full_traj_ate_median": full_traj_ate.get("median"),
+                }
+            )
 
     def _save_final_metrics_txt(self):
         traj_metrics_path = os.path.join(self.save_dir, "traj", "metrics_full_traj.txt")
@@ -286,7 +423,7 @@ class SLAM:
         stats_marker = "statistics:"
         marker_idx = traj_text.find(stats_marker)
         if marker_idx != -1:
-            stats_text = traj_text[marker_idx + len(stats_marker) :].strip()
+            stats_text = traj_text[marker_idx + len(stats_marker):].strip()
             try:
                 stats_dict = ast.literal_eval(stats_text)
                 rmse = stats_dict.get("rmse", None)
@@ -318,8 +455,6 @@ class SLAM:
         self.printer.print(f"Saved run timestamp to {run_created_at_path}", FontColor.EVAL)
 
     def _eval_depth_all(self, ate_statistics, global_scale, r_a, t_a):
-        """From Splat-SLAM. Not used in WildGS-SLAM evaluation, but might be useful in the future."""
-        # Evaluate depth error
         self.printer.print(
             "Evaluate sensor depth error with per frame alignment", FontColor.EVAL
         )
@@ -341,21 +476,18 @@ class SLAM:
             "Depth L1 mask 4m: " + str(depth_l1_max_4m_g), FontColor.EVAL
         )
 
-        # save output data to dict
-        # File path where you want to save the .txt file
         file_path = f"{self.save_dir}/depth_stats.txt"
         integers = {
             "depth_l1": depth_l1,
             "depth_l1_global_scale": depth_l1_g,
             "depth_l1_mask_4m": depth_l1_max_4m,
             "depth_l1_mask_4m_global_scale": depth_l1_max_4m_g,
-            "Average frame coverage": coverage,  # How much of each frame uses depth from droid (the rest from Omnidata)
+            "Average frame coverage": coverage,
             "traj scaling": global_scale,
             "traj rotation": r_a,
             "traj translation": t_a,
             "traj stats": ate_statistics,
         }
-        # Write to the file
         with open(file_path, "w") as file:
             for label, number in integers.items():
                 file.write(f"{label}: {number}\n")
@@ -373,12 +505,12 @@ class SLAM:
 
         if self.cfg['mapping']['enable']:
             processes = [
-                mp.Process(target=self.tracking, args=(t_pipe,)),                       # call tracking() function
-                mp.Process(target=self.mapping, args=(m_pipe,q_main2vis,q_vis2main)),   # call mapping() function
+                mp.Process(target=self.tracking, args=(t_pipe,)),
+                mp.Process(target=self.mapping, args=(m_pipe, q_main2vis, q_vis2main)),
             ]
         else:
             processes = [
-                mp.Process(target=self.tracking, args=(t_pipe,)),                       # call tracking() function
+                mp.Process(target=self.tracking, args=(t_pipe,)),
             ]
         self.num_running_thread[0] += len(processes)
         for p in processes:
@@ -388,10 +520,14 @@ class SLAM:
             time.sleep(5)
             pipeline_params = munchify(self.cfg["mapping"]["pipeline_params"])
             bg_color = [0, 0, 0]
-            background = torch.tensor(
-                bg_color, dtype=torch.float32, device=self.device
+            background = torch.tensor(bg_color, dtype=torch.float32, device=self.device)
+            gaussians = GaussianModel(
+                self.cfg['mapping']['model_params']['sh_degree'],
+                config=self.cfg,
+                dataset=self.cfg.get("dataset"),
+                raw=self.raw,
+                use_mlp=self.use_mlp,
             )
-            gaussians = GaussianModel(self.cfg['mapping']['model_params']['sh_degree'], config=self.cfg, dataset=self.dataset, raw=self.raw, use_mlp=self.use_mlp)
 
             params_gui = gui_utils.ParamsGUI(
                 pipe=pipeline_params,
@@ -402,27 +538,24 @@ class SLAM:
             )
             gui_process = mp.Process(target=slam_gui.run, args=(params_gui,))
             gui_process.start()
-            # self.num_running_thread[0] += 1
 
-        # visualizer
         if self.cfg['droidvis']:
             from src.utils.droid_visualization_rerun import droid_visualization_rerun
+
             self.visualizer = mp.Process(
                 target=droid_visualization_rerun,
                 args=(self.video,),
                 kwargs=dict(
-                    web_port=9876,                           # port the node will serve on
-                    record_path=f"{self.save_dir}/rerun_stream.rrd",  # optional
+                    web_port=9876,
+                    record_path=f"{self.save_dir}/rerun_stream.rrd",
                     exit_event=exit_event,
-                )
+                ),
             )
             self.visualizer.start()
-
 
         for p in processes:
             p.join()
 
-        # detect if the visualizer is still running
         if self.cfg['droidvis'] and self.visualizer.is_alive():
             exit_event.set()
             self.visualizer.join(timeout=10)
@@ -432,6 +565,7 @@ class SLAM:
         for process in mp.active_children():
             process.terminate()
             process.join()
+
 
 def gen_pose_matrix(R, T):
     pose = np.eye(4)

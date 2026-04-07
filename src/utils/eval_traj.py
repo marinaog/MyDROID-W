@@ -110,6 +110,18 @@ def traj_eval_and_plot(traj_est, traj_ref, plot_parent_dir, plot_name,printer):
     return ape_statistics
 
 
+def kf_traj_ate(npz_path, stream, printer):
+    """Compute keyframe ATE statistics without plotting artifacts."""
+    r_a, t_a, s, traj_est, traj_ref = align_kf_traj(npz_path, stream, printer=printer)
+
+    from evo.core import metrics
+
+    data = (traj_ref, traj_est)
+    ape_metric = metrics.APE(metrics.PoseRelation.translation_part)
+    ape_metric.process_data(data)
+    ape_statistics = ape_metric.get_all_statistics()
+    return ape_statistics, s, r_a, t_a
+
 def kf_traj_eval(npz_path, plot_parent_dir,plot_name, stream, logger,printer):
     r_a, t_a, s, traj_est, traj_ref = align_kf_traj(npz_path, stream,printer=printer)
 

@@ -12,6 +12,14 @@ debug: False
 traj_filler:
   use_dino_features: False
 
+wandb:
+  enable: True
+  offline: False   # True si quieres guardar local sin subir
+  project: "wildgs-slam"
+  tags: []
+  track_ate_per_keyframe: True
+  system_log_every_steps: 25
+
 mapping:
   enable: True
   online_plotting: False # render and save images online

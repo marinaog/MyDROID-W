@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -74,6 +75,7 @@ class Mapper(object):
         self.video: DepthVideo = slam.video
         self.save_dir = save_dir
         self.raw = self.config.get("raw")
+        self.wandb_logger = getattr(slam, "wandb_logger", None)
 
         self.lpips_fn = None
         try:
@@ -905,6 +907,21 @@ class Mapper(object):
     """
     Map Optimization functions (init, online, final_refine)
     """
+    def _log_mapping_step(self, stage, frame_idx, loss_value, iter_time_s):
+        if self.wandb_logger is None:
+            return
+        self.wandb_logger.log(
+            {
+                f"mapping/{stage}/loss": float(loss_value),
+                f"mapping/{stage}/iter_time_s": float(iter_time_s),
+                f"mapping/{stage}/iter_fps": (1.0 / float(iter_time_s)) if iter_time_s > 0 else 0.0,
+                "mapping/iteration": int(self.iteration_count),
+                "mapping/frame_idx": int(frame_idx),
+            },
+            step=int(self.iteration_count),
+        )
+        self.wandb_logger.log_system_stats(step=int(self.iteration_count))
+
     def initialize_map_opt(self):
         viewpoint_stack = []
         viewpoint_id_stack = []
@@ -914,6 +931,7 @@ class Mapper(object):
             viewpoint_id_stack.append(kf_idx)
 
         for mapping_iteration in range(self.init_itr_num):
+            iter_t0 = time.perf_counter()
             self.iteration_count += 1
             self.iterations_after_densify_or_reset += 1
             # randomly select a viewpoint from the first K keyframes
@@ -1001,6 +1019,13 @@ class Mapper(object):
 
                 self.frame_count_log[kf_idx] += 1
 
+            self._log_mapping_step(
+                stage="init",
+                frame_idx=int(self.video.timestamp[kf_idx]),
+                loss_value=float(loss_init.detach().item()),
+                iter_time_s=time.perf_counter() - iter_t0,
+            )
+
             self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
         self.printer.print("Initialized map", FontColor.MAPPER)
 
@@ -1048,6 +1073,7 @@ class Mapper(object):
         prob /= prob.sum()
 
         for cur_iter in range(iters):
+            iter_t0 = time.perf_counter()
             self.iteration_count += 1
             self.iterations_after_densify_or_reset += 1
 
@@ -1145,6 +1171,12 @@ class Mapper(object):
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
 
             self.frame_count_log[viewpoint_kf_idx_stack[cam_idx]] += 1
+            self._log_mapping_step(
+                stage="online",
+                frame_idx=int(self.video.timestamp[viewpoint_kf_idx_stack[cam_idx]]),
+                loss_value=float(loss_mapping.detach().item()),
+                iter_time_s=time.perf_counter() - iter_t0,
+            )
 
         # Online plotting
         if self.online_plotting:
@@ -1169,7 +1201,8 @@ class Mapper(object):
                 random_viewpoint_stack.append(viewpoint)
                 random_viewpoint_kf_idx_stack.append(kf_idx)
 
-        for _ in tqdm(range(iters)):
+        for refine_iter in tqdm(range(iters)):
+            iter_t0 = time.perf_counter()
             self.iteration_count += 1
             self.iterations_after_densify_or_reset += 1
 
@@ -1244,6 +1277,13 @@ class Mapper(object):
 
             for kf_idx in random_viewpoint_kf_idxs:
                 self.frame_count_log[kf_idx] += 1
+
+            self._log_mapping_step(
+                stage="refine",
+                frame_idx=int(self.video.timestamp[random_viewpoint_kf_idx_stack[rand_idx]]),
+                loss_value=float(loss_mapping.detach().item()),
+                iter_time_s=time.perf_counter() - iter_t0,
+            )
 
         if self.vis_uncertainty_online:
             self._vis_uncertainty_mask_all(is_final=True)
@@ -1591,6 +1631,7 @@ class Mapper(object):
         plot_dir = os.path.join(save_dir, "plots_" + iteration)
         mkdir_p(plot_dir)
         psnr_array, ssim_array, lpips_array, depth_l1_array = [], [], [], []
+        metric_rows = []
         if self.raw:
             psnr_array_raw, ssim_array_raw = [], []
 
@@ -1606,6 +1647,20 @@ class Mapper(object):
             depth_l1_array.append(metric["depth_l1"])
             if metric["lpips"] is not None:
                 lpips_array.append(metric["lpips"])
+
+            metric_rows.append(
+                [
+                    str(iteration),
+                    int(metric["video_idx"]),
+                    int(metric["frame_idx"]),
+                    float(metric["psnr"]),
+                    float(metric["ssim"]),
+                    float(metric["depth_l1"]),
+                    (float(metric["lpips"]) if metric["lpips"] is not None else None),
+                    (float(metric.get("psnr_raw")) if metric.get("psnr_raw") is not None else None),
+                    (float(metric.get("ssim_raw")) if metric.get("ssim_raw") is not None else None),
+                ]
+            )
             if self.raw:
                 psnr_array_raw.append(metric["psnr_raw"])
                 ssim_array_raw.append(metric["ssim_raw"])
@@ -1627,6 +1682,33 @@ class Mapper(object):
         metrics_json_path = os.path.join(plot_dir, "render_metrics_summary.json")
         with open(metrics_json_path, "w") as f:
             json.dump(render_metrics, f, indent=2)
+
+        if self.wandb_logger is not None:
+            self.wandb_logger.log(
+                {
+                    f"render/{iteration}/mean_psnr": render_metrics.get("mean_psnr"),
+                    f"render/{iteration}/mean_ssim": render_metrics.get("mean_ssim"),
+                    f"render/{iteration}/mean_lpips": render_metrics.get("mean_lpips"),
+                    f"render/{iteration}/depth_l1": render_metrics.get("depth_l1"),
+                    f"render/{iteration}/num_frames_evaluated": render_metrics.get("num_frames_evaluated"),
+                    f"render/{iteration}/num_frames_saved": render_metrics.get("num_frames_saved"),
+                }
+            )
+            self.wandb_logger.log_table(
+                key=f"render/{iteration}/per_keyframe_metrics",
+                columns=[
+                    "iteration",
+                    "video_idx",
+                    "frame_idx",
+                    "psnr",
+                    "ssim",
+                    "depth_l1",
+                    "lpips",
+                    "psnr_raw",
+                    "ssim_raw",
+                ],
+                rows=metric_rows,
+            )
 
         self.printer.print(
             f"Saved render metric summary to {metrics_json_path}",

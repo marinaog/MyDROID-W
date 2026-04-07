@@ -33,6 +33,7 @@ class MotionFilter:
         self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
         self.save_dir = output
         self.metric_depth_estimator = get_metric_depth_estimator(cfg)
+        self.last_track_stats = {"delta_mean": 0.0, "is_keyframe": False}
         if cfg['mapping']["uncertainty_params"]['activate']:
             # If mapping needs dino features, we still need feature extractor
             self.feat_extractor = get_feature_extractor(cfg)
@@ -65,6 +66,7 @@ class MotionFilter:
         gmap = self.__feature_encoder(inputs)       # [1, 128, 45, 80]
 
         force_to_add_keyframe = False
+        self.last_track_stats = {"delta_mean": 0.0, "is_keyframe": False}
 
         ### always add first frame to the depth video ###
         if self.video.counter.value == 0:
@@ -79,6 +81,7 @@ class MotionFilter:
                     # If mapping needs dino features, we predict here and store the value in local disk
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
             self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
+            self.last_track_stats["is_keyframe"] = True
         ### only add new frame if there is enough motion ###
         else:
             # index correlation volume
@@ -87,6 +90,7 @@ class MotionFilter:
 
             # approximate flow magnitude using 1 update iteration
             _, delta, weight = self.update(self.net[None], self.inp[None], corr)
+            self.last_track_stats["delta_mean"] = float(delta.norm(dim=-1).mean().item())
 
             if self.cfg['tracking']['force_keyframe_every_n_frames'] > 0:
                 # Actually, tstamp is the frame idx
@@ -95,7 +99,7 @@ class MotionFilter:
 
 
             # check motion magnitue / add new frame to video
-            if delta.norm(dim=-1).mean().item() > self.thresh or force_to_add_keyframe:
+            if self.last_track_stats["delta_mean"] > self.thresh or force_to_add_keyframe:
                 self.count = 0
                 net, inp = self.__context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
@@ -109,6 +113,7 @@ class MotionFilter:
                         _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
                 # add new frame to video, all params
                 self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)     # video.counter += 1
+                self.last_track_stats["is_keyframe"] = True
                 # gmap: torch.Size([1, 128, 45, 80]) net[0]: [128, 45, 80] inp: [1, 128, 45, 80], dino_features: [25, 45, 384]
             else:
                 self.count += 1
