@@ -75,7 +75,7 @@ def get_loss_tracking_rgb(config, image, opacity, viewpoint, uncertainty=None):
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
 
-    if config.get("raw"):
+    if config.get("raw") and config.get("clamp"):
         print('[CHECK] clamping in src.utils.slam_utils.py')
         image = torch.clamp(image, max=1.0)
 
@@ -139,7 +139,7 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint):
         None
     ]
 
-    if config.get("raw"):
+    if config.get("raw") and config.get("clamp"):
         image = torch.clamp(image, max=1.0)
 
     loss = 0
@@ -204,8 +204,8 @@ def get_loss_mapping_uncertainty(
     )
 
     # Clamp if raw
-    if raw:
-        image = torch.clamp(rendered_img, max=1.0)
+    if raw and config.get("raw") and config.get("clamp"):
+        rendered_img = torch.clamp(rendered_img, max=1.0)
 
     # Config parameters
     alpha = config["Training"].get("alpha", 0.95)
