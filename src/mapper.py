@@ -982,6 +982,7 @@ class Mapper(object):
                     viewpoint,
                     video_mask,
                     initialization=True,
+                    raw = self.raw
                 )
 
             scaling = self.gaussians.get_scaling
@@ -1115,7 +1116,7 @@ class Mapper(object):
                 target_shape = tuple(viewpoint.depth.shape[-2:])
                 video_mask = self._get_video_uncertainty_mask(kf_idx, target_shape)
                 loss_mapping += get_loss_mapping_uncertainty(
-                    self.config["mapping"], image, depth, viewpoint, video_mask
+                    self.config["mapping"], image, depth, viewpoint, video_mask, raw = self.raw
                 )
 
             scaling = self.gaussians.get_scaling
@@ -1254,7 +1255,7 @@ class Mapper(object):
                 target_shape = tuple(viewpoint.depth.shape[-2:])
                 video_mask = self._get_video_uncertainty_mask(kf_idx, target_shape)
                 loss_mapping += get_loss_mapping_uncertainty(
-                    self.config["mapping"], image, depth, viewpoint, video_mask
+                    self.config["mapping"], image, depth, viewpoint, video_mask, raw=self.raw
                 )
 
             viewspace_point_tensor_acm.append(viewspace_point_tensor)

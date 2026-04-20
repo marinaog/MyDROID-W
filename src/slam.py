@@ -440,11 +440,15 @@ class SLAM:
 
         header = "# ate rmse (m) | psnr | ssim | lpips | depth_l1 (m)"
         row_values = [rmse, psnr, ssim, lpips, depth_l1]
-        row = " , ".join("null" if v is None else str(v) for v in row_values)
 
         with open(out_path, "w") as f:
             f.write(header + "\n")
-            f.write(row + "\n")
+            for v in row_values:
+                if v is None:
+                    row = "null"
+                else:
+                    row = str(v)
+                f.write(row + "\n")
 
         run_created_at_path = os.path.join(self.save_dir, "run_created_at.txt")
         run_created_at_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")

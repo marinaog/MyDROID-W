@@ -97,7 +97,7 @@ def get_loss_tracking_rgb(config, image, opacity, viewpoint, uncertainty=None):
             weights = 0.5 / (uncertainty.unsqueeze(0))**2
             weights = torch.where(weights < 0.1, 0.0, weights)
             loss_rgb *= weights
-    return loss_rgb1.mean()
+    return loss_rgb.mean()
 
 # Not used, but kept for reference
 def get_loss_tracking_rgbd(
@@ -176,6 +176,7 @@ def get_loss_mapping_uncertainty(
     viewpoint,
     uncertainty_mask: Tensor,
     initialization: bool = False,
+    raw: bool = False
 ) -> Tensor:
     """Compute mapping loss weighted by BA-optimized uncertainty mask.
 
@@ -203,8 +204,8 @@ def get_loss_mapping_uncertainty(
     )
 
     # Clamp if raw
-    if config.get("raw"):
-        image = torch.clamp(image, max=1.0)
+    if raw:
+        image = torch.clamp(rendered_img, max=1.0)
 
     # Config parameters
     alpha = config["Training"].get("alpha", 0.95)
